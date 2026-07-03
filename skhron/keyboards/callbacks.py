@@ -1,0 +1,99 @@
+"""Все CallbackData-фабрики проекта — единый реестр, чтобы не пересекались
+префиксы и модули могли ссылаться на кнопки друг друга."""
+
+from aiogram.filters.callback_data import CallbackData
+
+
+class MenuCB(CallbackData, prefix="menu"):
+    # home | random | feed | favorites | upload | access | admin | help
+    action: str
+
+
+class RandomCB(CallbackData, prefix="rnd"):
+    # 0 = из всех доступных категорий
+    category_id: int
+
+
+class FeedPickCB(CallbackData, prefix="fpick"):
+    category_id: int
+
+
+class FeedCB(CallbackData, prefix="feed"):
+    # noop-кнопка (счётчик позиции) шлёт offset=-1
+    category_id: int
+    offset: int
+
+
+class FavPageCB(CallbackData, prefix="favp"):
+    # noop-кнопка шлёт offset=-1
+    offset: int
+
+
+class MediaActionCB(CallbackData, prefix="ma"):
+    # fav — в/из избранного; del — запрос удаления;
+    # delc — подтвердить удаление; delx — отменить удаление
+    action: str
+    media_id: int
+
+
+class UploadPickCB(CallbackData, prefix="upick"):
+    # выбор категории в потоке «из меню» (включая смену на лету в collecting)
+    category_id: int
+
+
+class UploadPendingPickCB(CallbackData, prefix="upickp"):
+    # выбор категории для уже присланных файлов (поток «сначала кинул медиа»);
+    # отдельная фабрика, чтобы протухшая кнопка не включала молча режим collecting
+    category_id: int
+
+
+class UploadDoneCB(CallbackData, prefix="updone"):
+    pass
+
+
+class AdminCB(CallbackData, prefix="adm"):
+    # home | cats | users | invites | stats | backup
+    section: str
+
+
+class CatAdminCB(CallbackData, prefix="admc"):
+    # list — список категорий (page); new — создать;
+    # open — карточка категории; ren — переименовать; arch — архив вкл/выкл;
+    # del — запрос удаления; delc — подтвердить удаление;
+    # users — доступы категории; adduser — выдать доступ
+    action: str
+    category_id: int = 0
+    page: int = 0
+
+
+class UserAdminCB(CallbackData, prefix="admu"):
+    # list — список юзеров (page); open — карточка юзера;
+    # tadmin — переключить админку; grant — выбрать категорию для выдачи;
+    # pview / pupload — переключить право в категории; revoke — отозвать доступ
+    action: str
+    user_id: int = 0
+    category_id: int = 0
+    page: int = 0
+
+
+class GroupRandomCB(CallbackData, prefix="grnd"):
+    # рандом ИЗ ГРУППЫ: права проверяются по chat_id сообщения;
+    # 0 = из всех разрешённых этой группе категорий
+    category_id: int
+
+
+class ChatAdminCB(CallbackData, prefix="admg"):
+    # list — список групп; open — карточка группы;
+    # toggle — разрешить/запретить категорию группе; forget — забыть группу
+    action: str
+    chat_id: int = 0
+    category_id: int = 0
+
+
+class InviteCB(CallbackData, prefix="inv"):
+    # list — список; new — начать создание; cat — переключить категорию
+    # в черновике; rights — переключить права; uses — выбрать лимит (value);
+    # create — сгенерировать; open — карточка; off — деактивировать
+    action: str
+    invite_id: int = 0
+    value: int = 0
