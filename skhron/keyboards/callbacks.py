@@ -19,13 +19,13 @@ class FeedPickCB(CallbackData, prefix="fpick"):
 
 
 class FeedCB(CallbackData, prefix="feed"):
-    # noop-кнопка (счётчик позиции) шлёт offset=-1
+    # offset=-1 — клик по счётчику «N/M»: открыть ввод номера поста
     category_id: int
     offset: int
 
 
 class FavPageCB(CallbackData, prefix="favp"):
-    # noop-кнопка шлёт offset=-1
+    # offset=-1 — клик по счётчику: открыть ввод номера поста
     offset: int
 
 
@@ -87,6 +87,18 @@ class GroupRandomCB(CallbackData, prefix="grnd"):
     # рандом ИЗ ГРУППЫ: права проверяются по chat_id сообщения;
     # 0 = из всех разрешённых этой группе категорий
     category_id: int
+
+
+class GroupFeedPickCB(CallbackData, prefix="gfpick"):
+    # выбор категории для ленты в группе
+    category_id: int
+
+
+class GroupFeedCB(CallbackData, prefix="gfeed"):
+    # лента В ГРУППЕ: права по chat_id сообщения;
+    # offset=-1 — клик по счётчику: открыть ввод номера поста
+    category_id: int
+    offset: int
 
 
 class ChatAdminCB(CallbackData, prefix="admg"):

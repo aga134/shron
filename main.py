@@ -11,6 +11,7 @@ from skhron.db.base import create_engine_and_sessionmaker, init_db
 from skhron.handlers import setup_routers
 from skhron.middlewares.db import DbSessionMiddleware
 from skhron.middlewares.user import UserMiddleware
+from skhron.utils.commands import setup_bot_commands
 
 
 async def main() -> None:
@@ -41,6 +42,7 @@ async def main() -> None:
 
     try:
         await bot.delete_webhook(drop_pending_updates=True)
+        await setup_bot_commands(bot, config)
         await dp.start_polling(bot)
     finally:
         await engine.dispose()

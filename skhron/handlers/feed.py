@@ -2,6 +2,9 @@
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import StateFilter
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     InlineKeyboardButton,
@@ -12,7 +15,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skhron.config import Config
 from skhron.db import repo
-from skhron.db.models import User
+from skhron.db.models import Media, User
 from skhron.keyboards.callbacks import FeedCB, FeedPickCB, MenuCB
 from skhron.keyboards.common import back_to_menu_kb, categories_pick_kb, media_kb
 from skhron.services import access
@@ -28,6 +31,14 @@ NO_ACCESS_TEXT = (
     "Пока у тебя нет доступа ни к одной категории 😕\n\n"
     "Попроси у друга инвайт-ссылку на Схрон — и тут сразу станет веселее!"
 )
+JUMP_PROMPT = "Напиши номер поста (1–{total}) — перейду к нему 🔢"
+JUMP_CANCELLED_TEXT = "Ок, не переходим 👌"
+NOT_A_NUMBER_TEXT = "Нужен просто номер, например 12"
+OUT_OF_RANGE_TEXT = "В ленте всего {total} постов, а ты просишь {num} 🙃"
+
+
+class FeedJumpStates(StatesGroup):
+    waiting_number = State()
 
 
 def _chat_id(callback: CallbackQuery) -> int:
@@ -58,24 +69,65 @@ async def _show_text_screen(
     await bot.send_message(_chat_id(callback), text, reply_markup=reply_markup)
 
 
+async def _clear_state_keep_dups(state: FSMContext) -> None:
+    """Снимает состояние, не теряя отложенные вопросы «похоже на дубль» —
+    их кнопки «Сохранить всё равно» ещё живы (паттерн из upload.py)."""
+    data = await state.get_data()
+    if data.get("dup_candidates"):
+        await state.set_state(None)
+        await state.set_data({"dup_candidates": data["dup_candidates"]})
+    else:
+        await state.clear()
+
+
 def _nav_row(category_id: int, offset: int, total: int) -> list[InlineKeyboardButton]:
-    """[◀️] [позиция/всего] [▶️]; неактивные края и счётчик — noop (offset=-1)."""
-    noop = FeedCB(category_id=category_id, offset=-1).pack()
+    """[◀️] [позиция/всего] [▶️]; счётчик и неактивные края — offset=-1:
+    клик открывает ввод номера поста для быстрого перехода."""
+    jump = FeedCB(category_id=category_id, offset=-1).pack()
     prev_cb = (
         FeedCB(category_id=category_id, offset=offset - 1).pack()
         if offset > 0
-        else noop
+        else jump
     )
     next_cb = (
         FeedCB(category_id=category_id, offset=offset + 1).pack()
         if offset + 1 < total
-        else noop
+        else jump
     )
     return [
         InlineKeyboardButton(text="◀️", callback_data=prev_cb),
-        InlineKeyboardButton(text=f"{offset + 1}/{total}", callback_data=noop),
+        InlineKeyboardButton(text=f"{offset + 1}/{total}", callback_data=jump),
         InlineKeyboardButton(text="▶️", callback_data=next_cb),
     ]
+
+
+async def _send_feed_media(
+    session: AsyncSession,
+    user: User,
+    config: Config,
+    bot: Bot,
+    chat_id: int,
+    media: Media,
+    category_id: int,
+    offset: int,
+    total: int,
+) -> None:
+    """Пост ленты уходит НОВЫМ сообщением; старые не удаляем — как в рандоме."""
+    category = await repo.get_category(session, media.category_id)
+    deletable = await access.can_delete_media(
+        session, user, config, media.uploaded_by
+    )
+    await send_media(
+        bot,
+        chat_id,
+        media,
+        caption=media_caption(media, category),
+        reply_markup=media_kb(
+            media.id,
+            deletable=deletable,
+            extra_rows=[_nav_row(category_id, offset, total)],
+        ),
+    )
 
 
 async def _show_feed_item(
@@ -103,25 +155,77 @@ async def _show_feed_item(
             await callback.answer("В категории пока пусто 🕸", show_alert=True)
             return
 
-    category = await repo.get_category(session, media.category_id)
-    deletable = await access.can_delete_media(
-        session, user, config, media.uploaded_by
-    )
-    await send_media(
+    await _send_feed_media(
+        session,
+        user,
+        config,
         bot,
         _chat_id(callback),
         media,
-        caption=media_caption(media, category),
-        reply_markup=media_kb(
-            media.id,
-            deletable=deletable,
-            extra_rows=[_nav_row(category_id, offset, total)],
-        ),
+        category_id,
+        offset,
+        total,
     )
-    # Удаляем предыдущий экран — эффект перелистывания
-    if isinstance(callback.message, Message):
+    await callback.answer()
+
+
+async def _start_jump(
+    callback: CallbackQuery,
+    session: AsyncSession,
+    user: User,
+    config: Config,
+    bot: Bot,
+    state: FSMContext,
+    category_id: int,
+) -> None:
+    """Клик по счётчику «N/M» — включаем режим «жду номер поста»."""
+    if not await access.can_view(session, user, config, category_id):
+        await callback.answer("Нет доступа к этой категории", show_alert=True)
+        return
+    _, total = await repo.get_feed_item(session, category_id, 0)
+    if total == 0:
+        await callback.answer("В категории пока пусто 🕸", show_alert=True)
+        return
+    kb = InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="↩️ Отмена",
+                    callback_data=FeedCB(
+                        category_id=category_id, offset=-2
+                    ).pack(),
+                )
+            ]
+        ]
+    )
+    # Сначала шлём вопрос и только при успехе ставим состояние (как в group.py):
+    # иначе после неудачной отправки юзер застрянет в режиме ввода
+    # без видимого промпта и кнопки «Отмена»
+    try:
+        await bot.send_message(
+            _chat_id(callback), JUMP_PROMPT.format(total=total), reply_markup=kb
+        )
+    except TelegramAPIError:
+        await callback.answer("Не получилось отправить вопрос 😕", show_alert=True)
+        return
+    # update_data (не set_data) — не затираем dup_candidates и данные других
+    # потоков; состояние collecting перезаписываем осознанно: юзер переключился
+    # на листание, его загрузка потом завершится как «протухшая»
+    await state.update_data(fjump_category_id=category_id, fjump_total=total)
+    await state.set_state(FeedJumpStates.waiting_number)
+    await callback.answer()
+
+
+async def _cancel_jump(callback: CallbackQuery, state: FSMContext) -> None:
+    """Кнопка «↩️ Отмена» (offset=-2): выходим из режима ввода номера.
+    Состояние снимаем только если это действительно наш режим — протухшая
+    кнопка не должна ломать чужой FSM-диалог."""
+    if await state.get_state() == FeedJumpStates.waiting_number.state:
+        await _clear_state_keep_dups(state)
+    message = callback.message
+    if isinstance(message, Message):
         try:
-            await callback.message.delete()
+            await message.edit_text(JUMP_CANCELLED_TEXT)
         except TelegramAPIError:
             pass
     await callback.answer()
@@ -169,10 +273,18 @@ async def feed_page(
     user: User,
     config: Config,
     bot: Bot,
+    state: FSMContext,
 ) -> None:
+    """Спец-коды offset: -1 — клик по счётчику «N/M» (или неактивному краю):
+    открыть ввод номера поста; -2 — «↩️ Отмена» под приглашением ввода
+    номера: выйти из режима ввода. Остальное — обычная навигация."""
     if callback_data.offset == -1:
-        # noop-кнопка (счётчик позиции)
-        await callback.answer()
+        await _start_jump(
+            callback, session, user, config, bot, state, callback_data.category_id
+        )
+        return
+    if callback_data.offset == -2:
+        await _cancel_jump(callback, state)
         return
     await _show_feed_item(
         callback,
@@ -182,4 +294,83 @@ async def feed_page(
         bot,
         callback_data.category_id,
         callback_data.offset,
+    )
+
+
+@router.message(
+    StateFilter(FeedJumpStates.waiting_number), F.chat.type == "private", F.text
+)
+async def feed_jump_number(
+    message: Message,
+    session: AsyncSession,
+    user: User,
+    config: Config,
+    bot: Bot,
+    state: FSMContext,
+) -> None:
+    """Юзер прислал номер поста — показываем этот пост новым сообщением."""
+    text = (message.text or "").strip()
+    if not text.isdecimal():
+        # isdecimal, а не isdigit: тот пропускает «²»/«①», на которых int()
+        # падает. Остаёмся в состоянии — пусть попробует ещё раз
+        await message.answer(NOT_A_NUMBER_TEXT)
+        return
+    num = int(text)
+
+    data = await state.get_data()
+    category_id = data.get("fjump_category_id")
+    if category_id is None:
+        # контекст потерялся — выходим из режима, чтобы не зациклить юзера
+        await _clear_state_keep_dups(state)
+        await message.answer("Что-то пошло не так — открой ленту заново 🤔")
+        return
+
+    # Категория могла закрыться, пока юзер думал
+    if not await access.can_view(session, user, config, category_id):
+        await _clear_state_keep_dups(state)
+        await message.answer("Категория уже недоступна")
+        return
+
+    # Свежий total: лента могла измениться после клика по счётчику.
+    # Проверяем диапазон ДО запроса с offset=num-1 — заодно отсекаем
+    # отрицательные и гигантские числа
+    _, total = await repo.get_feed_item(session, category_id, 0)
+    if total == 0:
+        # Ленту опустошили, пока юзер думал, — выходим, а не зацикливаем
+        # «всего 0 постов, а ты просишь N»
+        await _clear_state_keep_dups(state)
+        await message.answer("В категории пока пусто 🕸")
+        return
+    if num < 1 or num > total:
+        await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
+        return
+    media, total = await repo.get_feed_item(session, category_id, num - 1)
+    if media is None:
+        # гонка: лента сократилась между двумя запросами
+        await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
+        return
+
+    await _clear_state_keep_dups(state)
+    await _send_feed_media(
+        session,
+        user,
+        config,
+        bot,
+        message.chat.id,
+        media,
+        category_id,
+        num - 1,
+        total,
+    )
+
+
+@router.message(StateFilter(FeedJumpStates.waiting_number), F.chat.type == "private")
+async def feed_jump_media_abort(message: Message, state: FSMContext) -> None:
+    """Не-текст в режиме ввода номера (мем, стикер, войс): выходим из режима.
+    Иначе файл молча пропадёт — upload-хендлеры фильтруют по другим состояниям,
+    а случайный клик по счётчику превращается в тупик."""
+    await _clear_state_keep_dups(state)
+    await message.answer(
+        "Ок, выхожу из перехода по номеру 👌 "
+        "Пришли файл ещё раз — предложу, куда сохранить 📤"
     )

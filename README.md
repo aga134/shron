@@ -8,12 +8,12 @@ A self-hosted Telegram bot for archiving short videos, photos, and memes within 
 - **Per-user access control** — the admin grants each user view and/or upload rights per category
 - **Invite links** — deep-link invites (`t.me/<bot>?start=inv_<code>`) grant preconfigured permissions on first use; supports usage limits and view-only or view+upload modes
 - **Random** — fetch a random item from all accessible categories or from a specific one
-- **Feed** — browse a category item by item, sorted by upload date, with inline navigation
+- **Feed** — browse a category item by item, sorted by upload date, with inline navigation and jump-to-position (tap the counter and reply with a post number)
 - **Favorites** — per-user starred collection
 - **Upload** — send media directly to the bot (albums supported); the bot asks which category to store it in. Supported types: photo, video, animation (GIF), video note, voice, audio
 - **Deduplication** — exact duplicates are rejected per category by `file_unique_id`; near-duplicates (recompressed or re-uploaded copies) are detected via a perceptual hash (dHash) of the image or video thumbnail, and the bot shows the existing item and asks whether to save anyway
 - **Inline mode** — type `@<bot>` in any chat to search and post items from accessible categories (enable via BotFather `/setinline`)
-- **Group mode** — add the bot to a group chat and grant categories to the group as a whole; members use `/random` and `/categories` there. Group permissions are independent of personal ones
+- **Group mode** — add the bot to a group chat and grant categories to the group as a whole; members use `/random`, `/feed`, and `/categories` there. Group permissions are independent of personal ones
 - **Admin panel** — in-bot management of categories, users, permissions, groups, invites, and statistics
 - **Archive channel** — optional private channel that receives a copy of every upload; doubles as an automatic fallback source if a `file_id` send ever fails
 - **Database backup** — one-click export of the SQLite file to the admin's chat
@@ -100,6 +100,8 @@ Notable implementation details:
 - Invite redemption is idempotent and uses an atomic conditional `UPDATE` for the usage counter.
 - All callback handlers guard against `InaccessibleMessage` (buttons older than 48 hours).
 - Near-duplicate detection uses a pure-Pillow 64-bit dHash (Hamming distance threshold 8) computed from the photo itself or the Telegram-generated video thumbnail; audio and voice are matched by `file_unique_id` only. The admin command `/rehash` backfills hashes for photos uploaded before the feature was enabled.
+- Command hints (the `/` menu) are registered on startup via `setMyCommands` with separate scopes for private chats, group chats, and admins.
+- In groups, jump-to-position uses a `ForceReply` prompt, so it works with Bot API privacy mode enabled (the bot only receives replies to its own messages).
 
 ## Testing
 
