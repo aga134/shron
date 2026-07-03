@@ -11,7 +11,7 @@ A self-hosted Telegram bot for archiving short videos, photos, and memes within 
 - **Feed** — browse a category item by item, sorted by upload date, with inline navigation
 - **Favorites** — per-user starred collection
 - **Upload** — send media directly to the bot (albums supported); the bot asks which category to store it in. Supported types: photo, video, animation (GIF), video note, voice, audio
-- **Deduplication** — items are deduplicated per category by `file_unique_id`
+- **Deduplication** — exact duplicates are rejected per category by `file_unique_id`; near-duplicates (recompressed or re-uploaded copies) are detected via a perceptual hash (dHash) of the image or video thumbnail, and the bot shows the existing item and asks whether to save anyway
 - **Inline mode** — type `@<bot>` in any chat to search and post items from accessible categories (enable via BotFather `/setinline`)
 - **Group mode** — add the bot to a group chat and grant categories to the group as a whole; members use `/random` and `/categories` there. Group permissions are independent of personal ones
 - **Admin panel** — in-bot management of categories, users, permissions, groups, invites, and statistics
@@ -99,6 +99,7 @@ Notable implementation details:
 - Category IDs use `sqlite_autoincrement` to prevent rowid reuse from resurrecting stale invite grants.
 - Invite redemption is idempotent and uses an atomic conditional `UPDATE` for the usage counter.
 - All callback handlers guard against `InaccessibleMessage` (buttons older than 48 hours).
+- Near-duplicate detection uses a pure-Pillow 64-bit dHash (Hamming distance threshold 8) computed from the photo itself or the Telegram-generated video thumbnail; audio and voice are matched by `file_unique_id` only. The admin command `/rehash` backfills hashes for photos uploaded before the feature was enabled.
 
 ## Testing
 

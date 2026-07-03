@@ -24,3 +24,11 @@ def create_engine_and_sessionmaker(database_path: str):
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+        # лёгкая миграция: create_all не добавляет колонки в существующие
+        # таблицы, поэтому добиваем недостающие вручную
+        result = await conn.exec_driver_sql("PRAGMA table_info(media)")
+        columns = [row[1] for row in result.fetchall()]
+        if "phash" not in columns:
+            await conn.exec_driver_sql(
+                "ALTER TABLE media ADD COLUMN phash VARCHAR(16)"
+            )

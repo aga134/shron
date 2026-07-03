@@ -76,6 +76,13 @@ class UserAdminCB(CallbackData, prefix="admu"):
     page: int = 0
 
 
+class DupCB(CallbackData, prefix="dup"):
+    # вопрос «похоже на дубль — сохранить всё равно?»
+    # save — сохранить; skip — не сохранять. key — ключ файла в FSM data
+    action: str
+    key: str
+
+
 class GroupRandomCB(CallbackData, prefix="grnd"):
     # рандом ИЗ ГРУППЫ: права проверяются по chat_id сообщения;
     # 0 = из всех разрешённых этой группе категорий

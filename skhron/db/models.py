@@ -65,6 +65,9 @@ class Media(Base):
     media_type: Mapped[str] = mapped_column(String(16))
     caption: Mapped[str | None] = mapped_column(Text)
     uploaded_by: Mapped[int | None] = mapped_column(BigInteger, index=True)
+    # перцептивный dHash картинки/кадра-превью (16 hex-символов, 64 бита);
+    # None — тип без картинки (войс/аудио) или превью не удалось скачать
+    phash: Mapped[str | None] = mapped_column(String(16))
     # Ссылка на резервную копию в канале-архиве (если настроен)
     archive_chat_id: Mapped[int | None] = mapped_column(BigInteger)
     archive_message_id: Mapped[int | None] = mapped_column(BigInteger)

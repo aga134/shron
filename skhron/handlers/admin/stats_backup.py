@@ -1,11 +1,13 @@
-"""Админка: статистика Схрона и бэкап файла БД."""
+"""Админка: статистика Схрона, бэкап файла БД и докачка pHash (/rehash)."""
 
+import asyncio
 import html
 import logging
 from datetime import datetime
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
+from aiogram.filters import Command
 from aiogram.types import (
     CallbackQuery,
     FSInputFile,
@@ -13,11 +15,12 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
-from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from skhron.config import Config
 from skhron.db import repo
 from skhron.keyboards.callbacks import AdminCB
+from skhron.services.dedup import compute_phash_from_file
 from skhron.utils.media import MEDIA_TYPE_LABELS
 
 logger = logging.getLogger(__name__)
@@ -112,3 +115,109 @@ async def send_backup(callback: CallbackQuery, bot: Bot, config: Config) -> None
         )
         return
     await callback.answer("💾 Бэкап улетел!")
+
+
+_REHASH_VIDEO_NOTE = (
+    "Видео и гифки получают хэш при загрузке — "
+    "для старых записей его не восстановить."
+)
+
+# Фоновая задача /rehash: прогон долгий, и держать его внутри хендлера нельзя —
+# per-user lock SimpleEventIsolation заблокировал бы все апдейты админа.
+_rehash_task: asyncio.Task | None = None
+
+
+async def _rehash_worker(
+    bot: Bot,
+    session_factory: async_sessionmaker[AsyncSession],
+    items: list[tuple[int, str]],
+    progress_msg: Message,
+) -> None:
+    """Считает хэши со своей сессией: сессия хендлера закрывается вместе с ним."""
+    total = len(items)
+    done = 0
+    hashed = 0
+    failed = 0
+    try:
+        async with session_factory() as session:
+            for media_id, file_id in items:
+                # compute_phash_from_file сам глотает ошибки и вернёт None
+                phash = await compute_phash_from_file(bot, file_id)
+                if phash is None:
+                    failed += 1
+                else:
+                    await repo.set_media_phash(session, media_id, phash)
+                    hashed += 1
+                done += 1
+                if done % 25 == 0:
+                    try:
+                        await progress_msg.edit_text(f"🔁 {done}/{total}…")
+                    except TelegramAPIError:
+                        logger.warning("Не удалось обновить прогресс /rehash")
+                # небольшая пауза, чтобы не провоцировать 429
+                await asyncio.sleep(0.1)
+    except asyncio.CancelledError:
+        try:
+            await progress_msg.edit_text(f"⏹ Остановлено: успел {done}/{total}")
+        except TelegramAPIError:
+            logger.warning("Не удалось отправить итог остановки /rehash")
+        return
+    except Exception:
+        logger.exception("Прогон /rehash упал на %s/%s", done, total)
+        try:
+            await progress_msg.edit_text(
+                f"Прервалось на {done}/{total}, детали в логах"
+            )
+        except TelegramAPIError:
+            logger.warning("Не удалось отправить итог падения /rehash")
+        return
+    try:
+        await progress_msg.edit_text(
+            f"Готово: захэшировано {hashed}, не удалось {failed}.\n"
+            f"{_REHASH_VIDEO_NOTE}"
+        )
+    except TelegramAPIError:
+        logger.exception("Не удалось отправить итог /rehash")
+
+
+@router.message(Command("rehash"), F.chat.type == "private")
+async def rehash_media(
+    message: Message,
+    bot: Bot,
+    session: AsyncSession,
+    session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """Докачивает pHash задним числом — фоновой задачей.
+
+    Только для фото: их file_id — сама картинка. У видео/гифок/кружков
+    превью-кадр по file_id не достать, они хэшируются при новых загрузках.
+    """
+    global _rehash_task
+    if _rehash_task and not _rehash_task.done():
+        await message.answer(
+            "Уже считаю — останови через /rehash_stop, если надо"
+        )
+        return
+    items = [
+        (m.id, m.file_id)
+        for m in await repo.list_media_without_phash(session, media_type="photo")
+    ]
+    if not items:
+        await message.answer(f"Все фото уже с хэшами 👌\n{_REHASH_VIDEO_NOTE}")
+        return
+    progress_msg = await message.answer(
+        f"🔁 Запустил пересчёт: {len(items)} фото. "
+        "Прогресс буду обновлять здесь; /rehash_stop — остановить"
+    )
+    _rehash_task = asyncio.create_task(
+        _rehash_worker(bot, session_factory, items, progress_msg)
+    )
+
+
+@router.message(Command("rehash_stop"), F.chat.type == "private")
+async def rehash_stop(message: Message) -> None:
+    if _rehash_task and not _rehash_task.done():
+        _rehash_task.cancel()
+        await message.answer("Останавливаю…")
+    else:
+        await message.answer("Сейчас ничего не считается")

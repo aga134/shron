@@ -251,6 +251,7 @@ async def add_media(
     uploaded_by: int | None,
     archive_chat_id: int | None = None,
     archive_message_id: int | None = None,
+    phash: str | None = None,
 ) -> tuple[Media, bool]:
     """Возвращает (media, created).
 
@@ -274,6 +275,8 @@ async def add_media(
                 existing.archive_message_id = archive_message_id
             if caption:
                 existing.caption = caption
+            if phash:
+                existing.phash = phash
             await session.commit()
             return existing, True
         return existing, False
@@ -287,6 +290,7 @@ async def add_media(
         uploaded_by=uploaded_by,
         archive_chat_id=archive_chat_id,
         archive_message_id=archive_message_id,
+        phash=phash,
     )
     session.add(media)
     await session.commit()
@@ -295,6 +299,72 @@ async def add_media(
 
 async def get_media(session: AsyncSession, media_id: int) -> Media | None:
     return await session.get(Media, media_id)
+
+
+async def get_media_by_unique_id(
+    session: AsyncSession, category_id: int, file_unique_id: str
+) -> Media | None:
+    """Точный дубль в категории (включая мягко удалённые — для restore-пути)."""
+    stmt = select(Media).where(
+        Media.category_id == category_id,
+        Media.file_unique_id == file_unique_id,
+    )
+    return (await session.execute(stmt)).scalar_one_or_none()
+
+
+async def find_similar_media(
+    session: AsyncSession,
+    category_id: int,
+    phash: str | None,
+    max_distance: int,
+    exclude_file_unique_id: str | None = None,
+) -> tuple[Media, int] | None:
+    """Ищет в категории визуально похожий файл по dHash.
+
+    Возвращает (самый похожий, расстояние) или None. Линейный проход
+    по хэшам категории — на масштабе «сотни мемов» это мгновенно.
+    """
+    from skhron.services.dedup import phash_distance
+
+    if not phash:
+        return None
+    stmt = select(Media).where(
+        Media.category_id == category_id,
+        Media.is_deleted.is_(False),
+        Media.phash.is_not(None),
+    )
+    if exclude_file_unique_id is not None:
+        stmt = stmt.where(Media.file_unique_id != exclude_file_unique_id)
+    best: Media | None = None
+    best_distance = max_distance + 1
+    for media in (await session.execute(stmt)).scalars():
+        distance = phash_distance(phash, media.phash)
+        if distance < best_distance:
+            best, best_distance = media, distance
+    if best is None:
+        return None
+    return best, best_distance
+
+
+async def list_media_without_phash(
+    session: AsyncSession, media_type: str | None = None
+) -> list[Media]:
+    """Медиа без хэша — для докачки хэшей задним числом (/rehash)."""
+    stmt = select(Media).where(
+        Media.is_deleted.is_(False), Media.phash.is_(None)
+    )
+    if media_type is not None:
+        stmt = stmt.where(Media.media_type == media_type)
+    return list((await session.execute(stmt)).scalars())
+
+
+async def set_media_phash(
+    session: AsyncSession, media_id: int, phash: str
+) -> None:
+    media = await session.get(Media, media_id)
+    if media is not None:
+        media.phash = phash
+        await session.commit()
 
 
 async def soft_delete_media(session: AsyncSession, media_id: int) -> None:

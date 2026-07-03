@@ -31,6 +31,8 @@ async def main() -> None:
     # альбома обрабатываются параллельно и затирают FSM-данные друг друга
     dp = Dispatcher(storage=MemoryStorage(), events_isolation=SimpleEventIsolation())
     dp["config"] = config
+    # для фоновых задач, живущих дольше одного апдейта (/rehash)
+    dp["session_factory"] = session_factory
 
     dp.update.outer_middleware(DbSessionMiddleware(session_factory))
     dp.update.outer_middleware(UserMiddleware())
