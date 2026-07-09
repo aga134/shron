@@ -98,6 +98,39 @@ async def test_add_media_restores_soft_deleted_duplicate(session):
     assert second.id == newer.id
 
 
+# ---------------------------------------------------------------- captions
+
+
+async def test_set_media_caption_sets_and_clears(session):
+    category = await make_category(session)
+    media = await make_media(session, category.id, uploaded_by=100)
+    assert media.caption is None
+
+    await repo.set_media_caption(session, media.id, "смешной кот")
+    assert (await repo.get_media(session, media.id)).caption == "смешной кот"
+
+    # перезапись новой подписью
+    await repo.set_media_caption(session, media.id, "очень смешной кот")
+    assert (await repo.get_media(session, media.id)).caption == "очень смешной кот"
+
+    # None — подпись убрана совсем
+    await repo.set_media_caption(session, media.id, None)
+    assert (await repo.get_media(session, media.id)).caption is None
+
+
+async def test_set_media_caption_unknown_id_is_noop(session):
+    """Несуществующий media_id (запись успели удалить жёстко) — тихий no-op."""
+    category = await make_category(session)
+    survivor = await make_media(session, category.id, uploaded_by=100, caption="жив")
+
+    await repo.set_media_caption(session, 99999, "в пустоту")
+
+    # чужие записи не задеты, новых не появилось
+    assert await repo.get_media(session, 99999) is None
+    assert (await repo.get_media(session, survivor.id)).caption == "жив"
+    assert await repo.count_media(session, category.id) == 1
+
+
 # ---------------------------------------------------------------- categories
 
 

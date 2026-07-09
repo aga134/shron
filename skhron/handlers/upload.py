@@ -743,6 +743,11 @@ async def upload_done(
         await clear_state_keep_pending(state)
         saved_count = data.get("saved_count", 0)
         text = f"Готово! Сохранено {saved_count} шт. 📦"
+        if saved_count:
+            text += (
+                "\n💡 Подпись помогает найти мем через 🔍 Поиск — "
+                "кнопка ✏️ под ним в ленте"
+            )
     else:
         # state=None: протухшая кнопка под старым сообщением — ничего
         # не чистим (dup_candidates живы) и не пугаем «Сохранено 0 шт.»

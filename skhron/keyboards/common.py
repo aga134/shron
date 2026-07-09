@@ -20,17 +20,26 @@ def back_to_menu_kb() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(inline_keyboard=[[menu_button()]])
 
 
+# Включён ли у бота инлайн-режим (/setinline у BotFather); ставится на старте
+# из main.py. Кнопку «🔍 Поиск» без инлайна показывать нельзя: Telegram
+# отклоняет ВСЮ клавиатуру ошибкой BUTTON_TYPE_INVALID, и меню не доходит.
+INLINE_ENABLED = True
+
+
 def main_menu_kb(is_admin: bool) -> InlineKeyboardMarkup:
     builder = InlineKeyboardBuilder()
     builder.button(text="🎲 Рандом", callback_data=MenuCB(action="random"))
     builder.button(text="📼 Лента", callback_data=MenuCB(action="feed"))
     builder.button(text="⭐️ Избранное", callback_data=MenuCB(action="favorites"))
     builder.button(text="📤 Загрузить", callback_data=MenuCB(action="upload"))
+    if INLINE_ENABLED:
+        # открывает инлайн-режим прямо в этом чате: сетка превью + поиск
+        builder.button(text="🔍 Поиск", switch_inline_query_current_chat="")
     builder.button(text="🔐 Мои доступы", callback_data=MenuCB(action="access"))
     builder.button(text="ℹ️ Помощь", callback_data=MenuCB(action="help"))
     if is_admin:
         builder.button(text="🛠 Админка", callback_data=MenuCB(action="admin"))
-    builder.adjust(2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 1, 1)
     return builder.as_markup()
 
 
@@ -59,7 +68,11 @@ def media_kb(
     deletable: bool = False,
     extra_rows: list[list[InlineKeyboardButton]] | None = None,
 ) -> InlineKeyboardMarkup:
-    """Стандартные кнопки под медиа: [доп. ряды] + [⭐️ (🗑)] + [⬅️ Меню]."""
+    """Стандартные кнопки под медиа: [доп. ряды] + [⭐️ (✏️ 🗑)] + [⬅️ Меню].
+
+    ✏️ и 🗑 показываются вместе: право менять подпись то же, что и удалять
+    (загрузивший или админ).
+    """
     actions = [
         InlineKeyboardButton(
             text="⭐️",
@@ -67,6 +80,12 @@ def media_kb(
         )
     ]
     if deletable:
+        actions.append(
+            InlineKeyboardButton(
+                text="✏️",
+                callback_data=MediaActionCB(action="cap", media_id=media_id).pack(),
+            )
+        )
         actions.append(
             InlineKeyboardButton(
                 text="🗑",

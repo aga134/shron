@@ -1,8 +1,11 @@
-"""Работа Схрона в группах: /random, /feed и /categories по правам самой группы.
+"""Работа Схрона в группах: /random, /feed и /categories по правам самой
+группы, /save реплаем — сохранение мема прямо из чата.
 
-Права выдаются админом на группу целиком (в его личной админке),
+Права на просмотр выдаются админом на группу целиком (в его личной админке),
 личные доступы участников здесь не участвуют — контент видят все.
-Загрузка и меню в группах не работают.
+Исключение — /save: сохраняет конкретный участник, поэтому нужна пара условий
+«категория открыта группе» + «у автора команды есть личное право загрузки».
+Меню в группах не работает.
 """
 
 import html
@@ -26,12 +29,22 @@ from aiogram.types import (
     Message,
 )
 from aiogram.utils.keyboard import InlineKeyboardBuilder
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from skhron.config import Config
 from skhron.db import repo
-from skhron.keyboards.callbacks import GroupFeedCB, GroupFeedPickCB, GroupRandomCB
+from skhron.db.models import Category, User
+from skhron.keyboards.callbacks import (
+    GroupFeedCB,
+    GroupFeedPickCB,
+    GroupRandomCB,
+    GroupSaveCB,
+)
 from skhron.services import access
-from skhron.utils.media import media_caption, send_media
+from skhron.services.archive import archive_copy
+from skhron.services.dedup import PHASH_MAX_DISTANCE, compute_phash_from_message
+from skhron.utils.media import extract_media, media_caption, send_media
 
 router = Router(name="group")
 
@@ -40,7 +53,8 @@ GROUP_TYPES = {"group", "supergroup"}
 GREETING_TEXT = (
     "Привет! Я Схрон 📦 — приватный архив мемов. "
     "Команды: /random — случайный мем, /feed — лента категории, "
-    "/categories — что открыто этой группе. "
+    "/categories — что открыто этой группе, "
+    "/save (ответом на мем) — сохранить его в Схрон. "
     "Какие категории доступны группе — решает мой админ."
 )
 NO_ACCESS_TEXT = (
@@ -306,6 +320,195 @@ async def group_feed(message: Message, session: AsyncSession, bot: Bot) -> None:
     await message.reply("Какую ленту листаем? 📼", reply_markup=builder.as_markup())
 
 
+# ---------------------------------------------------------------- /save реплаем
+
+
+async def _group_save(
+    bot: Bot,
+    session: AsyncSession,
+    config: Config,
+    user: User,
+    category: Category,
+    item: dict,
+) -> str:
+    """Сохранение мема из группы по item-словарю. Возвращает готовый
+    HTML-safe текст-ответ (title уже экранирован).
+
+    Порядок как в личном _save_one, но вместо вопроса «сохранить всё равно?»
+    похожий файл просто НЕ сохраняем: в группе не раскрываем контент категории
+    и не разводим диалоги. Точный дубль (по file_unique_id) проверяется ДО
+    поиска похожих: тот же самый файл всегда идёт прежним путём add_media
+    (честное «уже есть» + восстановление мягко удалённых).
+    """
+    # скаляры снимаем ДО add_media: rollback при гонке IntegrityError
+    # протухает ORM-объекты, и доступ к их полям после него упадёт
+    category_id = category.id
+    raw_title = category.title
+    title = html.escape(raw_title)
+    user_id = user.id
+    uploader_name = user.full_name
+
+    exact = await repo.get_media_by_unique_id(
+        session, category_id, item["file_unique_id"]
+    )
+    if exact is not None and not exact.is_deleted:
+        return f"⚠️ Уже есть в «{title}»"
+    if item.get("phash") and exact is None:
+        similar = await repo.find_similar_media(
+            session,
+            category_id,
+            item["phash"],
+            PHASH_MAX_DISTANCE,
+            exclude_file_unique_id=item["file_unique_id"],
+        )
+        if similar is not None:
+            return (
+                f"🤔 Очень похоже на то, что уже лежит в «{title}» — "
+                "не стал сохранять. Если это всё же другой мем, "
+                "сохрани его через личку бота"
+            )
+    media, created = await repo.add_media(
+        session,
+        category_id,
+        item["file_id"],
+        item["file_unique_id"],
+        item["media_type"],
+        item.get("caption"),
+        user_id,
+        phash=item.get("phash"),
+    )
+    if not created:
+        return f"⚠️ Уже есть в «{title}»"
+    if media.archive_message_id is None:
+        archive_chat_id, archive_message_id = await archive_copy(
+            bot,
+            config,
+            item["src_chat_id"],
+            item["src_message_id"],
+            item["media_type"],
+            raw_title,
+            uploader_name,
+        )
+        if archive_message_id is not None:
+            media.archive_chat_id = archive_chat_id
+            media.archive_message_id = archive_message_id
+            await session.commit()
+    return f"✅ Сохранил в «{title}» 📦"
+
+
+@router.message(Command("save"), F.chat.type.in_(GROUP_TYPES))
+async def group_save(
+    message: Message,
+    session: AsyncSession,
+    bot: Bot,
+    config: Config,
+    fsm_storage: BaseStorage,
+    user: User | None = None,
+) -> None:
+    """Сохранение мема из группового чата без похода в личку:
+    /save ответом на сообщение с медиа. Privacy mode не мешает — команды
+    бот видит всегда, а reply_to_message приезжает внутри самой команды."""
+    if message.reply_to_message is None:
+        await message.reply("Ответь командой /save на сообщение с мемом 🙂")
+        return
+    # бот мог попасть в группу до внедрения фичи — регистрируем лениво
+    await repo.upsert_chat(
+        session, message.chat.id, message.chat.title or "", message.chat.type
+    )
+    extracted = extract_media(message.reply_to_message)
+    if extracted is None:
+        await message.reply(
+            "В этом сообщении нет медиа, которое я умею хранить "
+            "(фото/видео/гифка/кружок/войс/аудио)"
+        )
+        return
+    if user is None:
+        # анонимный админ или отправитель «от имени канала»: middleware
+        # не кладёт user для ботов-масок, а без личности право загрузки
+        # не проверить и загрузку не атрибутировать
+        await message.reply(
+            "Не вижу, кто сохраняет 🙈 Анонимному админу /save недоступен — "
+            "сними анонимность или сохрани через личку бота"
+        )
+        return
+
+    cats = [
+        c
+        for c in await access.group_viewable_categories(session, message.chat.id)
+        if await access.can_upload(session, user, config, c.id)
+    ]
+    if not cats:
+        await message.reply(
+            "Сохранять могут те, у кого есть право загрузки в категории "
+            "этой группы — попроси у админа Схрона 🙂"
+        )
+        return
+
+    # phash считаем сразу: у GroupSaveCB-колбэка объекта Message с медиа
+    # уже не будет, поэтому в реестр кладём готовые извлечённые поля
+    reply = message.reply_to_message
+    media_type, file_id, file_unique_id = extracted
+    item = {
+        "media_type": media_type,
+        "file_id": file_id,
+        "file_unique_id": file_unique_id,
+        "caption": reply.caption,
+        "src_chat_id": reply.chat.id,
+        "src_message_id": reply.message_id,
+        "phash": await compute_phash_from_message(bot, reply),
+    }
+
+    if len(cats) == 1:
+        try:
+            result = await _group_save(bot, session, config, user, cats[0], item)
+        except (TelegramAPIError, SQLAlchemyError):
+            # rollback оставляет сессию рабочей для ответа-реплая
+            await session.rollback()
+            result = "Не получилось сохранить 😕 Попробуй ещё раз"
+        try:
+            await message.reply(result)
+        except TelegramAPIError:
+            pass
+        return
+
+    builder = InlineKeyboardBuilder()
+    for category in cats:
+        builder.row(
+            InlineKeyboardButton(
+                text=category.title,
+                callback_data=GroupSaveCB(category_id=category.id).pack(),
+            )
+        )
+    # вопрос — РЕПЛАЕМ на сообщение с мемом: так видно, о чём речь,
+    # и не важно, удалят ли потом саму команду /save
+    try:
+        question = await reply.reply(
+            "Куда сохранить? 📁", reply_markup=builder.as_markup()
+        )
+    except TelegramAPIError:
+        try:
+            await message.reply("Не получилось задать вопрос 😕")
+        except TelegramAPIError:
+            pass
+        return
+    # реестр ожидающих сохранений — в чат-скоупном контексте (как gjumps):
+    # запись фиксируем только ПОСЛЕ успешной отправки вопроса
+    ctx = _chat_jump_ctx(bot, fsm_storage, message.chat.id)
+    data = await ctx.get_data()
+    pending: dict = data.get("gsaves", {})
+    pending[str(question.message_id)] = {
+        "sender_id": user.id,
+        "category_ids": [c.id for c in cats],
+        "item": item,
+    }
+    if len(pending) > 20:
+        # брошенные вопросы не копим бесконечно: message_id растут монотонно,
+        # так что выкидываем самые старые ключи
+        for stale in sorted(pending, key=int)[: len(pending) - 20]:
+            del pending[stale]
+    await ctx.update_data(gsaves=pending)
+
+
 # ---------------------------------------------------------------- callbacks
 
 
@@ -410,6 +613,100 @@ async def group_feed_page(
     await _show_feed_from_callback(
         callback, session, bot, callback_data.category_id, callback_data.offset
     )
+
+
+@router.callback_query(GroupSaveCB.filter())
+async def group_save_pick(
+    callback: CallbackQuery,
+    callback_data: GroupSaveCB,
+    session: AsyncSession,
+    bot: Bot,
+    config: Config,
+    user: User,
+    fsm_storage: BaseStorage,
+) -> None:
+    """Выбор категории для /save. Объекта сообщения с медиа тут уже нет —
+    работаем по извлечённым полям из реестра gsaves."""
+    message = callback.message
+    if message is None:
+        await callback.answer()
+        return
+    # .chat есть и у InaccessibleMessage — этого достаточно
+    chat = message.chat
+    if chat.type not in GROUP_TYPES:
+        await callback.answer(
+            "Эта кнопка работает только в группе", show_alert=True
+        )
+        return
+
+    ctx = _chat_jump_ctx(bot, fsm_storage, chat.id)
+    data = await ctx.get_data()
+    pending: dict = data.get("gsaves", {})
+    key = str(message.message_id)
+    entry = pending.get(key)
+    if entry is None:
+        # бота перезапускали или запись вытеснило капом
+        if isinstance(message, Message):
+            try:
+                await message.edit_text("⌛️ Кнопка устарела")
+            except TelegramAPIError:
+                pass
+        await callback.answer("Кнопка устарела 🕰", show_alert=True)
+        return
+    if callback.from_user.id != entry.get("sender_id"):
+        await callback.answer(
+            "Эта кнопка для того, кто сохранял 🙂", show_alert=True
+        )
+        return
+
+    # честные проверки: кнопка могла пережить смену прав/категорий
+    if callback_data.category_id not in entry.get("category_ids", []):
+        await callback.answer(
+            "Эта категория тут не предлагалась 🤔", show_alert=True
+        )
+        return
+    category = await repo.get_category(session, callback_data.category_id)
+    if category is None:
+        await callback.answer("Категория куда-то делась 🤔", show_alert=True)
+        return
+    if not await access.group_can_view(session, chat.id, category.id):
+        await callback.answer(
+            "Эту категорию группе не открывали 🙈", show_alert=True
+        )
+        return
+    if not await access.can_upload(session, user, config, category.id):
+        await callback.answer(
+            "Сюда загружать нельзя — попроси доступ у админа 🔒", show_alert=True
+        )
+        return
+
+    try:
+        result = await _group_save(
+            bot, session, config, user, category, entry["item"]
+        )
+    except (TelegramAPIError, SQLAlchemyError):
+        # rollback оставляет сессию рабочей; запись НЕ удаляем —
+        # пусть попробует нажать ещё раз
+        await session.rollback()
+        await callback.answer(
+            "Не получилось сохранить 😕 Попробуй ещё раз", show_alert=True
+        )
+        return
+
+    pending.pop(key, None)
+    await ctx.update_data(gsaves=pending)
+    # вопрос — всегда текстовое сообщение, edit_text безопасен
+    if isinstance(message, Message):
+        try:
+            await message.edit_text(result)
+        except TelegramAPIError:
+            pass
+    # тост — plain text (HTML-entities убираем) и не длиннее 200 символов:
+    # длинные названия категорий иначе роняют answerCallbackQuery
+    toast = html.unescape(result)
+    if len(toast) > 200:
+        toast = toast[:199] + "…"
+    await callback.answer(toast)
 
 
 # ---------------------------------------------------------------- jump by number

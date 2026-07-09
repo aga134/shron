@@ -116,6 +116,10 @@ class Chat(Base):
     type: Mapped[str] = mapped_column(String(16), default="group")
     # False — бота выгнали из группы (запись храним, права переживают возврат)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    # «Мем дня»: минуты от полуночи в DISPLAY_TZ (None — выключен)
+    # и локальная дата последней отправки «YYYY-MM-DD» (защита от дублей)
+    daily_minutes: Mapped[int | None] = mapped_column(Integer)
+    daily_last_sent: Mapped[str | None] = mapped_column(String(10))
     added_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 

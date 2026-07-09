@@ -7,6 +7,7 @@ from skhron.keyboards.callbacks import (
     AdminCB,
     CatAdminCB,
     ChatAdminCB,
+    DailyCB,
     InviteCB,
     MenuCB,
     UserAdminCB,
@@ -40,6 +41,7 @@ def setup_admin_router() -> Router:
     @denied.callback_query(CatAdminCB.filter())
     @denied.callback_query(UserAdminCB.filter())
     @denied.callback_query(ChatAdminCB.filter())
+    @denied.callback_query(DailyCB.filter())
     @denied.callback_query(InviteCB.filter())
     async def admin_access_denied(callback: CallbackQuery) -> None:
         await callback.answer("Доступ закрыт: нужны права админа 🙅", show_alert=True)

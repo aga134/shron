@@ -21,14 +21,25 @@ def create_engine_and_sessionmaker(database_path: str):
     return engine, session_factory
 
 
+# create_all не добавляет колонки в существующие таблицы —
+# недостающие добиваем вручную: {таблица: {колонка: DDL-тип}}
+_LIGHT_MIGRATIONS = {
+    "media": {"phash": "VARCHAR(16)"},
+    "chats": {
+        "daily_minutes": "INTEGER",
+        "daily_last_sent": "VARCHAR(10)",
+    },
+}
+
+
 async def init_db(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
-        # лёгкая миграция: create_all не добавляет колонки в существующие
-        # таблицы, поэтому добиваем недостающие вручную
-        result = await conn.exec_driver_sql("PRAGMA table_info(media)")
-        columns = [row[1] for row in result.fetchall()]
-        if "phash" not in columns:
-            await conn.exec_driver_sql(
-                "ALTER TABLE media ADD COLUMN phash VARCHAR(16)"
-            )
+        for table, columns in _LIGHT_MIGRATIONS.items():
+            result = await conn.exec_driver_sql(f"PRAGMA table_info({table})")
+            existing = {row[1] for row in result.fetchall()}
+            for column, ddl in columns.items():
+                if column not in existing:
+                    await conn.exec_driver_sql(
+                        f"ALTER TABLE {table} ADD COLUMN {column} {ddl}"
+                    )

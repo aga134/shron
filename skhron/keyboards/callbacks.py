@@ -31,7 +31,8 @@ class FavPageCB(CallbackData, prefix="favp"):
 
 class MediaActionCB(CallbackData, prefix="ma"):
     # fav — в/из избранного; del — запрос удаления;
-    # delc — подтвердить удаление; delx — отменить удаление
+    # delc — подтвердить удаление; delx — отменить удаление;
+    # cap — изменить подпись; capx — отменить изменение подписи
     action: str
     media_id: int
 
@@ -87,6 +88,18 @@ class GroupRandomCB(CallbackData, prefix="grnd"):
     # рандом ИЗ ГРУППЫ: права проверяются по chat_id сообщения;
     # 0 = из всех разрешённых этой группе категорий
     category_id: int
+
+
+class GroupSaveCB(CallbackData, prefix="gsave"):
+    # выбор категории для /save в группе (кнопки жмёт только автор команды)
+    category_id: int
+
+
+class DailyCB(CallbackData, prefix="admd"):
+    # «мем дня» в админ-карточке группы: minutes — время в минутах
+    # от полуночи (DISPLAY_TZ), -1 — выключить
+    chat_id: int
+    minutes: int
 
 
 class GroupFeedPickCB(CallbackData, prefix="gfpick"):

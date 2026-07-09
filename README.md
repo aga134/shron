@@ -14,6 +14,9 @@ A self-hosted Telegram bot for archiving short videos, photos, and memes within 
 - **Deduplication** — exact duplicates are rejected per category by `file_unique_id`; near-duplicates (recompressed or re-uploaded copies) are detected via a perceptual hash (dHash) of the image or video thumbnail, and the bot shows the existing item and asks whether to save anyway
 - **Inline mode** — type `@<bot>` in any chat to search and post items from accessible categories (enable via BotFather `/setinline`)
 - **Group mode** — add the bot to a group chat and grant categories to the group as a whole; members use `/random`, `/feed`, and `/categories` there. Group permissions are independent of personal ones
+- **Save from group** — reply `/save` to any media message in a group to store it; the target category is chosen from the group's categories the sender can personally upload to
+- **Meme of the day** — optional per-group daily post at a configured time (admin panel, Groups section), picked randomly from the group's categories
+- **Captions after the fact** — the uploader or an admin can set or edit an item's caption via an inline button; captions feed the inline search. A Search button in the main menu opens the inline result grid
 - **Admin panel** — in-bot management of categories, users, permissions, groups, invites, and statistics
 - **Archive channel** — optional private channel that receives a copy of every upload; doubles as an automatic fallback source if a `file_id` send ever fails
 - **Database backup** — one-click export of the SQLite file to the admin's chat

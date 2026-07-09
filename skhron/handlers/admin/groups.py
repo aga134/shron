@@ -20,12 +20,20 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from skhron.db import repo
 from skhron.db.models import Chat, User
-from skhron.keyboards.callbacks import AdminCB, ChatAdminCB
+from skhron.keyboards.callbacks import AdminCB, ChatAdminCB, DailyCB
 
 router = Router(name="admin_groups")
 
+# Пресеты «мема дня»: минуты от полуночи в DISPLAY_TZ
+_DAILY_PRESETS = (540, 720, 1080, 1260)
+
 
 # ---------------------------------------------------------------- helpers
+
+
+def _fmt_minutes(minutes: int) -> str:
+    """540 -> «09:00»."""
+    return f"{minutes // 60:02d}:{minutes % 60:02d}"
 
 
 async def _show(
@@ -108,12 +116,21 @@ async def _render_group_card(
     }
 
     status = "🤖 бот в группе" if chat.is_active else "🚪 бота удалили из группы"
+    if chat.daily_minutes is None:
+        daily_line = "🌅 Мем дня: выключен"
+    else:
+        daily_line = (
+            f"🌅 Мем дня: {_fmt_minutes(chat.daily_minutes)} (по серверному поясу)"
+        )
     lines = [
         f"💬 <b>{html.escape(chat.title or 'Без названия')}</b>",
         f"ID: <code>{chat.id}</code>",
         status,
         f"📂 Открыто категорий: {len(allowed_ids)}",
+        daily_line,
     ]
+    if chat.daily_minutes is not None and not allowed_ids:
+        lines.append("⚠️ группе не открыто ни одной категории — постить нечего")
     if categories:
         lines.append("")
         lines.append("Жми на категорию, чтобы открыть или закрыть её группе:")
@@ -132,6 +149,28 @@ async def _render_group_card(
                 ).pack(),
             )
         )
+    daily_row = []
+    for minutes in _DAILY_PRESETS:
+        label = _fmt_minutes(minutes)
+        if chat.daily_minutes == minutes:
+            btn_text = f"✅ {label}"
+        elif minutes == _DAILY_PRESETS[0]:
+            btn_text = f"🌅 {label}"
+        else:
+            btn_text = label
+        daily_row.append(
+            InlineKeyboardButton(
+                text=btn_text,
+                callback_data=DailyCB(chat_id=chat.id, minutes=minutes).pack(),
+            )
+        )
+    daily_row.append(
+        InlineKeyboardButton(
+            text="❌ Выкл",
+            callback_data=DailyCB(chat_id=chat.id, minutes=-1).pack(),
+        )
+    )
+    builder.row(*daily_row)
     if not chat.is_active:
         builder.row(
             InlineKeyboardButton(
@@ -226,6 +265,32 @@ async def toggle_group_category(
         else:
             await callback.answer("Открыто группе ✅")
 
+    text, markup = await _render_group_card(session, chat)
+    await _show(callback, bot, text, markup)
+
+
+@router.callback_query(DailyCB.filter())
+async def set_group_daily(
+    callback: CallbackQuery,
+    callback_data: DailyCB,
+    session: AsyncSession,
+    bot: Bot,
+) -> None:
+    """Пресеты «мема дня» из карточки группы: время или выключить."""
+    chat = await repo.get_chat(session, callback_data.chat_id)
+    if chat is None:
+        await _show_missing_chat(callback, session, bot)
+        return
+    new_minutes = None if callback_data.minutes == -1 else callback_data.minutes
+    if chat.daily_minutes == new_minutes:
+        # повторный тап по активному пресету — ничего не меняем
+        await callback.answer("Уже установлено 👌")
+        return
+    await repo.set_chat_daily(session, chat.id, new_minutes)
+    if new_minutes is None:
+        await callback.answer("Мем дня выключен")
+    else:
+        await callback.answer(f"Мем дня в {_fmt_minutes(new_minutes)} ✅")
     text, markup = await _render_group_card(session, chat)
     await _show(callback, bot, text, markup)
 

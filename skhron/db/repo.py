@@ -391,6 +391,15 @@ async def set_media_phash(
         await session.commit()
 
 
+async def set_media_caption(
+    session: AsyncSession, media_id: int, caption: str | None
+) -> None:
+    media = await session.get(Media, media_id)
+    if media is not None:
+        media.caption = caption
+        await session.commit()
+
+
 async def soft_delete_media(session: AsyncSession, media_id: int) -> None:
     media = await session.get(Media, media_id)
     if media is not None:
@@ -583,6 +592,39 @@ async def list_chats(session: AsyncSession, active_only: bool = False) -> list[C
     return list((await session.execute(stmt)).scalars())
 
 
+async def set_chat_daily(
+    session: AsyncSession, chat_id: int, minutes: int | None
+) -> None:
+    """Время «мема дня» (минуты от полуночи в DISPLAY_TZ), None — выключить.
+
+    daily_last_sent сознательно НЕ сбрасывается: отметка «сегодня уже
+    постили» переживает смену времени, иначе повторный тап по пресету
+    отправлял бы второй мем за день. Новое время в будущем всё равно
+    сработает сегодня, если сегодня ещё не постили.
+    """
+    chat = await session.get(Chat, chat_id)
+    if chat is not None and chat.daily_minutes != minutes:
+        chat.daily_minutes = minutes
+        await session.commit()
+
+
+async def set_chat_daily_sent(
+    session: AsyncSession, chat_id: int, sent_date: str
+) -> None:
+    chat = await session.get(Chat, chat_id)
+    if chat is not None:
+        chat.daily_last_sent = sent_date
+        await session.commit()
+
+
+async def list_daily_chats(session: AsyncSession) -> list[Chat]:
+    """Активные группы с включённым «мемом дня»."""
+    stmt = select(Chat).where(
+        Chat.is_active.is_(True), Chat.daily_minutes.is_not(None)
+    )
+    return list((await session.execute(stmt)).scalars())
+
+
 async def delete_chat(session: AsyncSession, chat_id: int) -> None:
     """«Забыть» группу: каскадом уходят и её права."""
     chat = await session.get(Chat, chat_id)
@@ -599,7 +641,14 @@ async def migrate_chat(session: AsyncSession, old_id: int, new_id: int) -> None:
         return
     new = await session.get(Chat, new_id)
     if new is None:
-        new = Chat(id=new_id, title=old.title, type="supergroup", is_active=True)
+        new = Chat(
+            id=new_id,
+            title=old.title,
+            type="supergroup",
+            is_active=True,
+            daily_minutes=old.daily_minutes,
+            daily_last_sent=old.daily_last_sent,
+        )
         session.add(new)
         await session.flush()
     else:
@@ -607,6 +656,10 @@ async def migrate_chat(session: AsyncSession, old_id: int, new_id: int) -> None:
         new.type = "supergroup"
         if old.title and not new.title:
             new.title = old.title
+        # расписание «мема дня» переезжает, если у новой записи его нет
+        if new.daily_minutes is None and old.daily_minutes is not None:
+            new.daily_minutes = old.daily_minutes
+            new.daily_last_sent = old.daily_last_sent
     existing_ids = {
         p.category_id
         for p in (

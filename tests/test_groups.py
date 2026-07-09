@@ -1,10 +1,13 @@
 """Тесты групповой фичи: чаты, права групп (repo) и доступы (access)."""
 
+import sqlite3
+
 from conftest import make_category
 
 from sqlalchemy import select
 
 from skhron.db import repo
+from skhron.db.base import create_engine_and_sessionmaker, init_db
 from skhron.db.models import GroupPermission
 from skhron.services import access
 
@@ -288,3 +291,199 @@ async def test_delete_chat_cascades_group_permissions(session):
         ).scalars()
     )
     assert rows == []
+
+
+# ------------------------------------------------------------- daily meme
+
+
+async def test_set_chat_daily_enables_and_disables(session):
+    await repo.upsert_chat(session, CHAT_ID, "Чат", "group")
+
+    # включение: минуты сохраняются, отметка последней отправки чиста
+    await repo.set_chat_daily(session, CHAT_ID, 540)
+    chat = await repo.get_chat(session, CHAT_ID)
+    assert chat.daily_minutes == 540
+    assert chat.daily_last_sent is None
+
+    # выключение: None вместо минут
+    await repo.set_chat_daily(session, CHAT_ID, None)
+    chat = await repo.get_chat(session, CHAT_ID)
+    assert chat.daily_minutes is None
+    assert chat.daily_last_sent is None
+
+
+async def test_set_chat_daily_keeps_last_sent(session):
+    """Отметка «сегодня уже постили» переживает смену времени: повторный
+    тап по пресету или перенос времени не шлёт второй мем за день."""
+    await repo.upsert_chat(session, CHAT_ID, "Чат", "group")
+    await repo.set_chat_daily(session, CHAT_ID, 540)
+    await repo.set_chat_daily_sent(session, CHAT_ID, "2026-07-10")
+
+    await repo.set_chat_daily(session, CHAT_ID, 720)  # смена времени
+    chat = await repo.get_chat(session, CHAT_ID)
+    assert chat.daily_minutes == 720
+    assert chat.daily_last_sent == "2026-07-10"
+
+    await repo.set_chat_daily(session, CHAT_ID, 720)  # no-op повтор
+    chat = await repo.get_chat(session, CHAT_ID)
+    assert chat.daily_last_sent == "2026-07-10"
+
+
+async def test_migrate_chat_carries_daily_schedule(session):
+    """Миграция в супергруппу переносит расписание «мема дня»."""
+    await repo.upsert_chat(session, CHAT_ID, "Чат", "group")
+    await repo.set_chat_daily(session, CHAT_ID, 540)
+    await repo.set_chat_daily_sent(session, CHAT_ID, "2026-07-10")
+
+    new_id = CHAT_ID - 1_000_000
+    await repo.migrate_chat(session, CHAT_ID, new_id)
+
+    migrated = await repo.get_chat(session, new_id)
+    assert migrated is not None
+    assert migrated.daily_minutes == 540
+    assert migrated.daily_last_sent == "2026-07-10"
+    assert new_id in {c.id for c in await repo.list_daily_chats(session)}
+
+
+async def test_set_chat_daily_unknown_chat_is_noop(session):
+    """Незнакомый chat_id не роняет и не создаёт запись."""
+    await repo.set_chat_daily(session, -424242, 540)
+    assert await repo.get_chat(session, -424242) is None
+
+
+async def test_set_chat_daily_sent(session):
+    await repo.upsert_chat(session, CHAT_ID, "Чат", "group")
+    await repo.set_chat_daily(session, CHAT_ID, 540)
+
+    await repo.set_chat_daily_sent(session, CHAT_ID, "2026-07-10")
+
+    chat = await repo.get_chat(session, CHAT_ID)
+    assert chat.daily_last_sent == "2026-07-10"
+    assert chat.daily_minutes == 540  # расписание не тронуто
+
+    # незнакомый чат — тихий no-op
+    await repo.set_chat_daily_sent(session, -424242, "2026-07-10")
+    assert await repo.get_chat(session, -424242) is None
+
+
+async def test_list_daily_chats_only_active_with_schedule(session):
+    scheduled = await repo.upsert_chat(session, -1, "С расписанием", "group")
+    await repo.set_chat_daily(session, scheduled.id, 540)
+
+    midnight = await repo.upsert_chat(session, -2, "Полуночный", "group")
+    await repo.set_chat_daily(session, midnight.id, 0)  # 0 минут — валидное время
+
+    plain = await repo.upsert_chat(session, -3, "Без расписания", "group")
+
+    kicked = await repo.upsert_chat(session, -4, "Покинутый", "group")
+    await repo.set_chat_daily(session, kicked.id, 600)
+    await repo.set_chat_active(session, kicked.id, False)
+
+    switched_off = await repo.upsert_chat(session, -5, "Выключенный", "group")
+    await repo.set_chat_daily(session, switched_off.id, 600)
+    await repo.set_chat_daily(session, switched_off.id, None)
+
+    daily = await repo.list_daily_chats(session)
+    assert {c.id for c in daily} == {scheduled.id, midnight.id}
+    assert plain.id not in {c.id for c in daily}
+
+
+# ------------------------------------------------- light schema migration
+
+# Схема chats, которую create_all генерировал ДО колонок «мема дня»
+_OLD_CHATS_DDL = """
+CREATE TABLE chats (
+    id BIGINT NOT NULL,
+    title VARCHAR(256) NOT NULL,
+    type VARCHAR(16) NOT NULL,
+    is_active BOOLEAN NOT NULL,
+    added_at DATETIME NOT NULL,
+    PRIMARY KEY (id)
+)
+"""
+
+
+async def test_init_db_adds_daily_columns_to_existing_chats(tmp_path):
+    """Лёгкая миграция: существующая таблица chats без daily_* получает
+    обе колонки, старые данные целы, новые поля — NULL."""
+    db_path = tmp_path / "old.db"
+    con = sqlite3.connect(db_path)
+    try:
+        con.execute(_OLD_CHATS_DDL)
+        con.execute(
+            "INSERT INTO chats VALUES (?,?,?,?,?)",
+            (-100500, "Старый чат", "group", 1, "2024-01-01 00:00:00"),
+        )
+        con.commit()
+        columns = {row[1] for row in con.execute("PRAGMA table_info(chats)")}
+        assert "daily_minutes" not in columns
+        assert "daily_last_sent" not in columns
+    finally:
+        con.close()
+
+    engine, session_factory = create_engine_and_sessionmaker(db_path.as_posix())
+    try:
+        await init_db(engine)
+
+        # ORM видит мигрированную запись и умеет включать «мем дня»
+        async with session_factory() as session:
+            chat = await repo.get_chat(session, -100500)
+            assert chat is not None
+            assert chat.title == "Старый чат"
+            assert chat.daily_minutes is None
+            assert chat.daily_last_sent is None
+
+            await repo.set_chat_daily(session, -100500, 540)
+            await repo.set_chat_daily_sent(session, -100500, "2026-07-10")
+            daily = await repo.list_daily_chats(session)
+            assert [c.id for c in daily] == [-100500]
+    finally:
+        await engine.dispose()
+
+    con = sqlite3.connect(db_path)
+    try:
+        info = list(con.execute("PRAGMA table_info(chats)"))
+        columns = {row[1] for row in info}
+        assert {"daily_minutes", "daily_last_sent"} <= columns
+        # новые колонки — nullable (ALTER без NOT NULL/DEFAULT)
+        notnull = {row[1]: row[3] for row in info}
+        assert notnull["daily_minutes"] == 0
+        assert notnull["daily_last_sent"] == 0
+        # старые данные целы и дополнены новыми значениями
+        row = con.execute(
+            "SELECT id, title, type, is_active, added_at,"
+            " daily_minutes, daily_last_sent FROM chats"
+        ).fetchone()
+        assert row == (
+            -100500, "Старый чат", "group", 1, "2024-01-01 00:00:00",
+            540, "2026-07-10",
+        )
+    finally:
+        con.close()
+
+
+async def test_init_db_second_run_keeps_daily_columns(tmp_path):
+    """Повторный init_db не дублирует колонки и не трогает данные."""
+    db_path = tmp_path / "twice.db"
+    engine, session_factory = create_engine_and_sessionmaker(db_path.as_posix())
+    try:
+        await init_db(engine)
+        async with session_factory() as session:
+            await repo.upsert_chat(session, CHAT_ID, "Чат", "group")
+            await repo.set_chat_daily(session, CHAT_ID, 540)
+
+        await init_db(engine)  # второй прогон — no-op для chats
+
+        async with session_factory() as session:
+            chat = await repo.get_chat(session, CHAT_ID)
+            assert chat.daily_minutes == 540
+    finally:
+        await engine.dispose()
+
+    con = sqlite3.connect(db_path)
+    try:
+        names = [row[1] for row in con.execute("PRAGMA table_info(chats)")]
+        assert names.count("daily_minutes") == 1
+        assert names.count("daily_last_sent") == 1
+    finally:
+        con.close()

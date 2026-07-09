@@ -32,6 +32,7 @@ ADMIN_COMMANDS = PRIVATE_COMMANDS + [
 GROUP_COMMANDS = [
     BotCommand(command="random", description="Случайный мем"),
     BotCommand(command="feed", description="Лента категории"),
+    BotCommand(command="save", description="Сохранить мем (ответом на него)"),
     BotCommand(command="categories", description="Что открыто этой группе"),
 ]
 

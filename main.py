@@ -14,6 +14,7 @@ from skhron.handlers import setup_routers
 from skhron.handlers.admin.stats_backup import shutdown_rehash
 from skhron.middlewares.db import DbSessionMiddleware
 from skhron.middlewares.user import UserMiddleware
+from skhron.services.scheduler import start_scheduler, stop_scheduler
 from skhron.utils.commands import setup_bot_commands
 
 logger = logging.getLogger("skhron")
@@ -45,8 +46,9 @@ async def main() -> None:
     dp.update.outer_middleware(UserMiddleware())
 
     dp.include_router(setup_routers())
-    # фоновый /rehash гасим до закрытия сессии бота и engine.dispose()
+    # фоновые задачи гасим до закрытия сессии бота и engine.dispose()
     dp.shutdown.register(shutdown_rehash)
+    dp.shutdown.register(stop_scheduler)
 
     @dp.errors()
     async def on_error(event: ErrorEvent) -> None:
@@ -68,8 +70,20 @@ async def main() -> None:
     try:
         # без drop_pending_updates: присланное за время даунтайма не выбрасываем
         await bot.delete_webhook()
+        me = await bot.me()
+        if not me.supports_inline_queries:
+            # без /setinline у BotFather кнопку «Поиск» показывать нельзя —
+            # Telegram отклонит всю клавиатуру главного меню
+            from skhron.keyboards import common
+
+            common.INLINE_ENABLED = False
+            logger.warning(
+                "Инлайн-режим у BotFather выключен — кнопка «🔍 Поиск» скрыта. "
+                "Включи через /setinline и перезапусти бота."
+            )
         async with session_factory() as session:
             await setup_bot_commands(bot, config, session)
+        await start_scheduler(bot, session_factory)
         await dp.start_polling(bot)
     finally:
         await engine.dispose()
