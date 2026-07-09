@@ -50,8 +50,11 @@ class Category(Base):
 
 class Media(Base):
     __tablename__ = "media"
+    # AUTOINCREMENT: id удалённых записей не переиспользуются, иначе
+    # протухшие кнопки ⭐️/🗑 действовали бы на чужой новый файл
     __table_args__ = (
         UniqueConstraint("category_id", "file_unique_id", name="uq_media_cat_file"),
+        {"sqlite_autoincrement": True},
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)

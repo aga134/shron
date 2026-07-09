@@ -20,6 +20,8 @@ from skhron.db import repo
 from skhron.db.models import Category, User
 from skhron.handlers.admin.panel import show_text_screen
 from skhron.keyboards.callbacks import AdminCB, CatAdminCB, UserAdminCB
+from skhron.utils.dates import fmt_date
+from skhron.utils.fsm import clear_state_keep_pending
 
 router = Router(name="admin_categories")
 
@@ -89,14 +91,20 @@ async def _render_card(
     session: AsyncSession, category: Category
 ) -> tuple[str, InlineKeyboardMarkup]:
     files_count = await repo.count_media(session, category.id)
-    users_count = len(await repo.list_category_users(session, category.id))
+    # считаем только реальные доступы: записи с выключенным просмотром
+    # (can_view=False) категорию не открывают
+    users_count = sum(
+        1
+        for perm, _member in await repo.list_category_users(session, category.id)
+        if perm.can_view
+    )
     lines = [
         f"📁 <b>{html.escape(category.title)}</b>",
         "",
         f"Статус: {'📦 в архиве' if category.is_archived else '✅ активна'}",
         f"Файлов: {files_count}",
         f"Доступов: {users_count}",
-        f"Создана: {category.created_at.strftime('%d.%m.%Y')}",
+        f"Создана: {fmt_date(category.created_at)}",
     ]
     if category.is_archived:
         lines += [
@@ -163,8 +171,9 @@ def _cancel_kb(text: str, cb: CatAdminCB) -> InlineKeyboardMarkup:
 async def show_categories(
     callback: CallbackQuery, session: AsyncSession, state: FSMContext
 ) -> None:
-    # Сюда ведут кнопки-отмены — чистим состояние, это безопасно
-    await state.clear()
+    # Сюда ведут кнопки-отмены — сбрасываем диалог, сохраняя данные
+    # живых кнопок (pending/dup_candidates из загрузки)
+    await clear_state_keep_pending(state)
     text, kb = await _render_list(session)
     await show_text_screen(callback, text, kb)
     await callback.answer()
@@ -202,7 +211,7 @@ async def create_category(
             reply_markup=_cancel_kb("↩️ Отмена", CatAdminCB(action="list")),
         )
         return
-    await state.clear()
+    await clear_state_keep_pending(state)
     text, kb = await _render_card(session, category)
     await message.answer(text, reply_markup=kb)
 
@@ -217,8 +226,9 @@ async def open_category(
     session: AsyncSession,
     state: FSMContext,
 ) -> None:
-    # Сюда тоже ведут кнопки-отмены (ren/adduser) — чистим состояние
-    await state.clear()
+    # Сюда тоже ведут кнопки-отмены (ren/adduser) — сбрасываем диалог,
+    # сохраняя данные живых кнопок (pending/dup_candidates)
+    await clear_state_keep_pending(state)
     category = await repo.get_category(session, callback_data.category_id)
     if category is None:
         await callback.answer(
@@ -261,7 +271,7 @@ async def do_rename(
     data = await state.get_data()
     category = await repo.get_category(session, data.get("category_id", 0))
     if category is None:
-        await state.clear()
+        await clear_state_keep_pending(state)
         await message.answer(
             "Упс, категория куда-то делась 🙈 Начни заново из админки: /admin"
         )
@@ -279,7 +289,7 @@ async def do_rename(
     if not await repo.rename_category(session, category.id, title):
         await message.answer("Название занято, другое? 🤔", reply_markup=cancel)
         return
-    await state.clear()
+    await clear_state_keep_pending(state)
     text, kb = await _render_card(session, category)
     await message.answer(text, reply_markup=kb)
 
@@ -366,12 +376,17 @@ async def category_users(
     lines = [f"👥 <b>Доступы к «{html.escape(category.title)}»</b>", ""]
     if pairs:
         for perm, member in pairs:
-            icons = "👁" + ("📤" if perm.can_upload else "")
+            icons = ("👁" if perm.can_view else "🚫") + (
+                "📤" if perm.can_upload else ""
+            )
             line = f"{icons} {html.escape(member.full_name or '—')}"
             if member.username:
                 line += f" (@{html.escape(member.username)})"
             lines.append(line)
-        lines += ["", "<i>👁 — просмотр, 📤 — ещё и загрузка</i>"]
+        lines += [
+            "",
+            "<i>👁 — просмотр, 📤 — ещё и загрузка, 🚫 — просмотр выключен</i>",
+        ]
     else:
         lines.append("Пока никому не выдан доступ. Админы видят её и так 😎")
     rows: list[list[InlineKeyboardButton]] = []
@@ -445,7 +460,7 @@ async def grant_user(
     data = await state.get_data()
     category = await repo.get_category(session, data.get("category_id", 0))
     if category is None:
-        await state.clear()
+        await clear_state_keep_pending(state)
         await message.answer(
             "Упс, категория куда-то делась 🙈 Начни заново из админки: /admin"
         )
@@ -498,10 +513,17 @@ async def grant_user(
         )
         return
 
-    await repo.set_permission(
+    granted = await repo.set_permission(
         session, target.id, category.id, can_view=True, granted_by=user.id
     )
-    await state.clear()
+    if granted is None:
+        # кросс-админская гонка: категорию/юзера успели удалить параллельно
+        await message.answer(
+            "Права уже изменили параллельно 🤝 Попробуй ещё раз.",
+            reply_markup=cancel,
+        )
+        return
+    await clear_state_keep_pending(state)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [

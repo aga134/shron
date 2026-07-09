@@ -44,6 +44,12 @@ Docker:
 docker compose up -d --build
 ```
 
+The container runs as an unprivileged user (uid 1000), so the bind-mounted data directory on the host must be writable by that uid. One-time setup:
+
+```bash
+sudo chown -R 1000:1000 ./data
+```
+
 Bare Python:
 
 ```bash
@@ -53,6 +59,23 @@ python main.py
 
 The bot runs on long polling; no inbound ports or webhooks are required. The SQLite database is created at `DATABASE_PATH` (default `data/skhron.db`, mounted as a volume in `docker-compose.yml`).
 
+### Updating
+
+```bash
+git pull
+docker compose up -d --build
+docker image prune -f
+```
+
+`docker image prune -f` removes the dangling image layers left behind by each rebuild.
+
+Installations created before the container switched to a non-root user need a
+one-time ownership fix, since `./data` was created by root back then:
+
+```bash
+sudo chown -R 1000:1000 ./data
+```
+
 ## Configuration
 
 | Variable | Required | Description |
@@ -61,6 +84,7 @@ The bot runs on long polling; no inbound ports or webhooks are required. The SQL
 | `ADMIN_IDS` | yes | Comma-separated Telegram user IDs with admin rights |
 | `ARCHIVE_CHANNEL_ID` | no | ID of a private archive channel (`-100...`); the bot must be an admin there |
 | `DATABASE_PATH` | no | SQLite file path, default `data/skhron.db` |
+| `DISPLAY_TZ` | no | IANA timezone for dates shown to users (upload dates, backup captions), default `Europe/Moscow`. Timestamps are stored in UTC and converted for display |
 
 Admins listed in `ADMIN_IDS` are permanent; additional admins can be promoted from the admin panel (stored in the database).
 

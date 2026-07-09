@@ -15,6 +15,7 @@ from skhron.db.models import User
 from skhron.keyboards.callbacks import MenuCB
 from skhron.keyboards.common import back_to_menu_kb, main_menu_kb
 from skhron.services import access
+from skhron.utils.fsm import clear_state_keep_pending
 
 router = Router(name="menu")
 
@@ -50,7 +51,9 @@ async def _show_text_screen(
 
 @router.message(Command("menu"), F.chat.type == "private")
 async def cmd_menu(message: Message, state: FSMContext, is_admin: bool) -> None:
-    await state.clear()
+    # не state.clear(): вопросы «куда сохранить?» и «похоже на дубль»
+    # ещё висят в чате с живыми кнопками
+    await clear_state_keep_pending(state)
     await message.answer(MENU_TEXT, reply_markup=main_menu_kb(is_admin))
 
 
@@ -58,7 +61,7 @@ async def cmd_menu(message: Message, state: FSMContext, is_admin: bool) -> None:
 async def cb_home(
     callback: CallbackQuery, state: FSMContext, is_admin: bool, bot: Bot
 ) -> None:
-    await state.clear()
+    await clear_state_keep_pending(state)
     await _show_text_screen(callback, bot, MENU_TEXT, main_menu_kb(is_admin))
     await callback.answer()
 

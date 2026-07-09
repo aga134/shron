@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skhron.db import repo
 from skhron.db.models import User
 from skhron.keyboards.callbacks import AdminCB, InviteCB
+from skhron.utils.fsm import clear_state_keep_pending
 
 router = Router(name="admin_invites")
 
@@ -165,7 +166,7 @@ async def _render_draft(
 async def open_invites_section(
     callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext
 ) -> None:
-    await state.clear()
+    await clear_state_keep_pending(state)
     text, markup = await _render_invites_list(session)
     await _show(callback, bot, text, markup)
     await callback.answer()
@@ -175,7 +176,9 @@ async def open_invites_section(
 async def invites_list(
     callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext
 ) -> None:
-    await state.clear()
+    # кнопка «↩️ Отмена» черновика тоже ведёт сюда — сбрасываем диалог,
+    # не теряя данные живых кнопок (pending/dup_candidates)
+    await clear_state_keep_pending(state)
     text, markup = await _render_invites_list(session)
     await _show(callback, bot, text, markup)
     await callback.answer()
@@ -186,7 +189,15 @@ async def new_invite(
     callback: CallbackQuery, session: AsyncSession, bot: Bot, state: FSMContext
 ) -> None:
     await state.set_state(InviteStates.drafting)
-    await state.set_data({"cat_ids": [], "can_upload": False, "max_uses": 1})
+    # set_data затирает все данные — переносим ключи, на которые ещё
+    # смотрят живые кнопки: «💾 Сохранить всё равно» (dup_candidates)
+    # и «Куда сохранить?» (pending)
+    old_data = await state.get_data()
+    draft: dict = {"cat_ids": [], "can_upload": False, "max_uses": 1}
+    for key in ("pending", "dup_candidates"):
+        if old_data.get(key):
+            draft[key] = old_data[key]
+    await state.set_data(draft)
     text, markup = await _render_draft(session, await state.get_data())
     await _show(callback, bot, text, markup)
     await callback.answer()
@@ -268,7 +279,16 @@ async def draft_create(
     max_uses: int = data.get("max_uses", 1)
 
     invite = await repo.create_invite(session, cat_ids, can_upload, max_uses, user.id)
-    await state.clear()
+    if invite is None:
+        # все выбранные категории успели удалить параллельно —
+        # черновик остаётся, конструктор перерисуем со свежим списком
+        await callback.answer(
+            "Категории уже удалили — собери инвайт заново 🤷", show_alert=True
+        )
+        text, markup = await _render_draft(session, await state.get_data())
+        await _show(callback, bot, text, markup)
+        return
+    await clear_state_keep_pending(state)
 
     link = await _invite_link(bot, invite.code)
     titles = []
@@ -306,7 +326,11 @@ async def draft_lost(
 ) -> None:
     """Кнопки конструктора нажаты вне состояния drafting (например, после
     перезапуска бота) — черновика больше нет, возвращаем к списку."""
-    await state.clear()
+    if await state.get_state() is not None:
+        # Чужой активный FSM-диалог (создание категории и т.п.) — не трогаем
+        await callback.answer("Сначала заверши текущее действие 🙂", show_alert=True)
+        return
+    # состояние уже None — чистить нечего, просто возвращаем к списку
     await callback.answer("Черновик потерялся 😅 Собери инвайт заново", show_alert=True)
     text, markup = await _render_invites_list(session)
     await _show(callback, bot, text, markup)

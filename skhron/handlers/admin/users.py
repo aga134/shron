@@ -20,6 +20,8 @@ from skhron.config import Config
 from skhron.db import repo
 from skhron.db.models import Category, Permission, User
 from skhron.keyboards.callbacks import AdminCB, UserAdminCB
+from skhron.utils.commands import set_admin_scope
+from skhron.utils.dates import fmt_date
 
 router = Router(name="admin_users")
 
@@ -128,7 +130,7 @@ async def _render_user_card(
         lines.append("⭐️ админ (из конфига)")
     elif target.is_admin:
         lines.append("⭐️ админ")
-    lines.append(f"🗓 В Схроне с {target.created_at.strftime('%d.%m.%Y')}")
+    lines.append(f"🗓 В Схроне с {fmt_date(target.created_at)}")
     lines.append("")
     if perms:
         lines.append("🔐 Доступы:")
@@ -304,6 +306,9 @@ async def toggle_admin(
         return
     new_value = not target.is_admin
     await repo.set_admin(session, target.id, new_value)
+    # сразу включаем/выключаем подсказки /admin в личке юзера
+    # (ошибки Telegram set_admin_scope глотает сам)
+    await set_admin_scope(bot, target.id, new_value)
     text, markup = await _render_user_card(
         session, config, target, page=callback_data.page
     )
@@ -354,18 +359,35 @@ async def toggle_permission_flag(
     granted_by = user.id if perm is None else None
     if callback_data.action == "pview":
         new_value = not (perm.can_view if perm is not None else False)
-        await repo.set_permission(
+        updated = await repo.set_permission(
             session, target.id, category.id, can_view=new_value, granted_by=granted_by
         )
     else:
         new_value = not (perm.can_upload if perm is not None else False)
-        await repo.set_permission(
+        updated = await repo.set_permission(
             session,
             target.id,
             category.id,
             can_upload=new_value,
             granted_by=granted_by,
         )
+    if updated is None:
+        # кросс-админская гонка: второй админ успел отозвать доступ или
+        # удалить категорию/юзера. Rollback внутри set_permission протухил
+        # ORM-объекты — перечитываем их перед рендером
+        target = await repo.get_user(session, callback_data.user_id)
+        category = await repo.get_category(session, callback_data.category_id)
+        if target is None or category is None:
+            await callback.answer(
+                "Юзер или категория уже не существуют 🤷", show_alert=True
+            )
+            return
+        await callback.answer("Права уже изменили параллельно 🤝", show_alert=True)
+        text, markup = await _render_perm_card(
+            session, target, category, page=callback_data.page
+        )
+        await _show(callback, bot, text, markup)
+        return
 
     # Карточка рисуется «с нуля»: сюда можно попасть и из categories.py,
     # где текущее сообщение — совсем другой экран.
@@ -452,6 +474,7 @@ async def grant_permission(
     callback_data: UserAdminCB,
     session: AsyncSession,
     user: User,
+    config: Config,
     bot: Bot,
 ) -> None:
     target = await repo.get_user(session, callback_data.user_id)
@@ -461,9 +484,24 @@ async def grant_permission(
             "Юзер или категория уже не существуют 🤷", show_alert=True
         )
         return
-    await repo.set_permission(
+    granted = await repo.set_permission(
         session, target.id, category.id, can_view=True, granted_by=user.id
     )
+    if granted is None:
+        # кросс-админская гонка: категорию/юзера успели удалить параллельно.
+        # Rollback внутри set_permission протухил объекты — перечитываем
+        target = await repo.get_user(session, callback_data.user_id)
+        if target is None:
+            await callback.answer(
+                "Юзер или категория уже не существуют 🤷", show_alert=True
+            )
+            return
+        await callback.answer("Права уже изменили параллельно 🤝", show_alert=True)
+        text, markup = await _render_user_card(
+            session, config, target, page=callback_data.page
+        )
+        await _show(callback, bot, text, markup)
+        return
     text, markup = await _render_perm_card(
         session, target, category, page=callback_data.page
     )

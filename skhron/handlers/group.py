@@ -455,7 +455,7 @@ async def _start_group_jump(
         prompt = await bot.send_message(
             chat.id,
             f"{mention}, ответь на это сообщение номером поста (1–{total}) 🔢\n"
-            "(или напиши «отмена»)",
+            "(или ответь «отмена»)",
             reply_markup=ForceReply(selective=True),
             message_thread_id=thread_id,
         )

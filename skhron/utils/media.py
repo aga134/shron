@@ -8,6 +8,7 @@ from aiogram.exceptions import TelegramBadRequest
 from aiogram.types import InlineKeyboardMarkup, Message, MessageId
 
 from skhron.db.models import Category, Media
+from skhron.utils.dates import fmt_date
 
 logger = logging.getLogger(__name__)
 
@@ -64,7 +65,7 @@ def media_caption(media: Media, category: Category | None) -> str:
     footer_bits = []
     if category is not None:
         footer_bits.append(f"📁 {html.escape(category.title)}")
-    footer_bits.append(media.created_at.strftime("%d.%m.%Y"))
+    footer_bits.append(fmt_date(media.created_at))
     parts.append(f"<i>{' · '.join(footer_bits)}</i>")
     return "\n\n".join(parts)
 

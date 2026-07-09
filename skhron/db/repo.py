@@ -11,6 +11,7 @@ import secrets
 from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm.exc import StaleDataError
 
 from skhron.db.models import (
     Category,
@@ -81,6 +82,11 @@ async def set_admin(session: AsyncSession, user_id: int, is_admin: bool) -> None
     if user is not None:
         user.is_admin = is_admin
         await session.commit()
+
+
+async def list_admins(session: AsyncSession) -> list[User]:
+    stmt = select(User).where(User.is_admin.is_(True))
+    return list((await session.execute(stmt)).scalars())
 
 
 # ---------------------------------------------------------------- categories
@@ -180,8 +186,12 @@ async def set_permission(
     can_view: bool | None = None,
     can_upload: bool | None = None,
     granted_by: int | None = None,
-) -> Permission:
-    """Upsert: не переданные флаги не трогаются."""
+) -> Permission | None:
+    """Upsert: не переданные флаги не трогаются.
+
+    None — запись не удалось создать/обновить из-за параллельного
+    изменения (второй админ отозвал доступ или удалил категорию/юзера).
+    """
     perm = await session.get(Permission, (user_id, category_id))
     if perm is None:
         perm = Permission(
@@ -199,7 +209,13 @@ async def set_permission(
             perm.can_upload = can_upload
         if granted_by is not None:
             perm.granted_by = granted_by
-    await session.commit()
+    try:
+        await session.commit()
+    except (IntegrityError, StaleDataError):
+        # кросс-админская гонка: вставку/апдейт перегнал revoke или
+        # удаление категории — перечитываем финальное состояние
+        await session.rollback()
+        return await session.get(Permission, (user_id, category_id))
     return perm
 
 
@@ -293,7 +309,15 @@ async def add_media(
         phash=phash,
     )
     session.add(media)
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # кросс-юзерская гонка: тот же файл успел вставить кто-то другой
+        await session.rollback()
+        existing = (await session.execute(stmt)).scalar_one_or_none()
+        if existing is not None:
+            return existing, False
+        raise
     return media, True
 
 
@@ -405,6 +429,8 @@ async def get_feed_item(
     offset=0 — самый новый.
     """
     total = await count_media(session, category_id)
+    # кламп: callback_data подделываем, а OFFSET за 2^63 роняет SQLite
+    offset = max(0, min(offset, total))
     stmt = (
         select(Media)
         .where(Media.category_id == category_id, Media.is_deleted.is_(False))
@@ -439,6 +465,7 @@ async def get_favorite_item(
             select(func.count()).select_from(base.subquery())
         )
     ).scalar_one()
+    offset = max(0, min(offset, total))
     stmt = (
         base.order_by(Favorite.created_at.desc(), Media.id.desc())
         .offset(offset)
@@ -707,7 +734,8 @@ async def create_invite(
     can_upload: bool,
     max_uses: int,
     created_by: int | None,
-) -> Invite:
+) -> Invite | None:
+    """None — все выбранные категории успели удалить (черновик протух)."""
     invite = Invite(
         code=secrets.token_urlsafe(8),
         category_ids=",".join(str(c) for c in category_ids),
@@ -716,6 +744,20 @@ async def create_invite(
         created_by=created_by,
     )
     session.add(invite)
+    # flush открывает транзакцию записи — сериализуемся с delete_category
+    await session.flush()
+    existing = set(
+        (
+            await session.execute(
+                select(Category.id).where(Category.id.in_(category_ids))
+            )
+        ).scalars()
+    )
+    valid = [c for c in category_ids if c in existing]
+    if not valid:
+        await session.rollback()
+        return None
+    invite.category_ids = ",".join(str(c) for c in valid)
     await session.commit()
     return invite
 
@@ -802,5 +844,11 @@ async def redeem_invite(
         await session.refresh(invite)
         if invite.max_uses and invite.used_count >= invite.max_uses:
             invite.is_active = False
-    await session.commit()
+    try:
+        await session.commit()
+    except IntegrityError:
+        # гонка с параллельной выдачей тех же прав — считаем редим неудавшимся,
+        # юзер просто кликнет ссылку ещё раз
+        await session.rollback()
+        return []
     return granted

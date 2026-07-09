@@ -11,7 +11,10 @@ from aiogram.types import (
     BotCommandScopeChat,
 )
 
+from sqlalchemy.ext.asyncio import AsyncSession
+
 from skhron.config import Config
+from skhron.db import repo
 
 logger = logging.getLogger(__name__)
 
@@ -33,7 +36,9 @@ GROUP_COMMANDS = [
 ]
 
 
-async def setup_bot_commands(bot: Bot, config: Config) -> None:
+async def setup_bot_commands(
+    bot: Bot, config: Config, session: AsyncSession
+) -> None:
     try:
         await bot.set_my_commands(
             PRIVATE_COMMANDS, scope=BotCommandScopeAllPrivateChats()
@@ -43,12 +48,27 @@ async def setup_bot_commands(bot: Bot, config: Config) -> None:
         )
     except TelegramAPIError:
         logger.warning("Не удалось зарегистрировать подсказки команд", exc_info=True)
-    # админам из конфига — расширенный список (в их личке с ботом)
-    for admin_id in config.admin_ids:
-        try:
+    # админам — расширенный список: и из конфига, и повышенным через админку
+    admin_ids = set(config.admin_ids)
+    admin_ids.update(user.id for user in await repo.list_admins(session))
+    for admin_id in admin_ids:
+        await set_admin_scope(bot, admin_id, True)
+
+
+async def set_admin_scope(bot: Bot, user_id: int, is_admin: bool) -> None:
+    """Включает/выключает админ-подсказки в личке конкретного юзера.
+
+    Зовётся на старте и при повышении/снятии через админку.
+    """
+    try:
+        if is_admin:
             await bot.set_my_commands(
-                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=admin_id)
+                ADMIN_COMMANDS, scope=BotCommandScopeChat(chat_id=user_id)
             )
-        except TelegramAPIError:
-            # чат с ботом ещё не открыт — подсказки появятся после рестарта
-            pass
+        else:
+            await bot.delete_my_commands(
+                scope=BotCommandScopeChat(chat_id=user_id)
+            )
+    except TelegramAPIError:
+        # чат с ботом ещё не открыт — подсказки появятся после рестарта
+        pass

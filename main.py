@@ -5,13 +5,18 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage, SimpleEventIsolation
+from aiogram.types import ErrorEvent
 
 from skhron.config import load_config
 from skhron.db.base import create_engine_and_sessionmaker, init_db
+from skhron.db.migrate import pre_migrate
 from skhron.handlers import setup_routers
+from skhron.handlers.admin.stats_backup import shutdown_rehash
 from skhron.middlewares.db import DbSessionMiddleware
 from skhron.middlewares.user import UserMiddleware
 from skhron.utils.commands import setup_bot_commands
+
+logger = logging.getLogger("skhron")
 
 
 async def main() -> None:
@@ -21,6 +26,7 @@ async def main() -> None:
     )
     config = load_config()
 
+    pre_migrate(config.database_path)
     engine, session_factory = create_engine_and_sessionmaker(config.database_path)
     await init_db(engine)
 
@@ -39,10 +45,31 @@ async def main() -> None:
     dp.update.outer_middleware(UserMiddleware())
 
     dp.include_router(setup_routers())
+    # фоновый /rehash гасим до закрытия сессии бота и engine.dispose()
+    dp.shutdown.register(shutdown_rehash)
+
+    @dp.errors()
+    async def on_error(event: ErrorEvent) -> None:
+        """Последний рубеж: логируем и гасим спиннер, чтобы юзер не ждал."""
+        logger.exception(
+            "Необработанная ошибка в апдейте %s",
+            event.update.update_id,
+            exc_info=event.exception,
+        )
+        callback = event.update.callback_query
+        if callback is not None:
+            try:
+                await callback.answer(
+                    "Что-то пошло не так 😵 Попробуй ещё раз", show_alert=True
+                )
+            except Exception:  # noqa: BLE001 — уже внутри обработчика ошибок
+                pass
 
     try:
-        await bot.delete_webhook(drop_pending_updates=True)
-        await setup_bot_commands(bot, config)
+        # без drop_pending_updates: присланное за время даунтайма не выбрасываем
+        await bot.delete_webhook()
+        async with session_factory() as session:
+            await setup_bot_commands(bot, config, session)
         await dp.start_polling(bot)
     finally:
         await engine.dispose()

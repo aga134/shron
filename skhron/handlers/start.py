@@ -13,6 +13,7 @@ from skhron.db import repo
 from skhron.db.models import User
 from skhron.keyboards.callbacks import MenuCB
 from skhron.keyboards.common import back_to_menu_kb, main_menu_kb
+from skhron.utils.fsm import clear_state_keep_pending
 
 router = Router(name="start")
 
@@ -96,7 +97,14 @@ async def cmd_start(
     user: User,
     is_admin: bool,
 ) -> None:
-    await state.clear()
+    # не state.clear(): и при обычном /start, и при активации инвайта
+    # вопросы «куда сохранить?» / «похоже на дубль» ещё висят в чате
+    # с живыми кнопками — сохраняем pending и dup_candidates
+    await clear_state_keep_pending(state)
+
+    # приветствие собираем до редима: rollback внутри redeem_invite
+    # (гонка) протухает объект user, и доступ к его полям упадёт
+    greeting = _greeting_text(user)
 
     args = command.args or ""
     if args.startswith("inv_"):
@@ -124,7 +132,7 @@ async def cmd_start(
                 f"{lines}{upload_note}"
             )
 
-    await message.answer(_greeting_text(user), reply_markup=main_menu_kb(is_admin))
+    await message.answer(greeting, reply_markup=main_menu_kb(is_admin))
 
 
 @router.message(Command("help"), F.chat.type == "private")

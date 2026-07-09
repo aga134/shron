@@ -1,5 +1,6 @@
 from aiogram import F, Router
-from aiogram.types import CallbackQuery
+from aiogram.filters import Command
+from aiogram.types import CallbackQuery, Message
 
 from skhron.filters import AdminFilter
 from skhron.keyboards.callbacks import (
@@ -42,6 +43,13 @@ def setup_admin_router() -> Router:
     @denied.callback_query(InviteCB.filter())
     async def admin_access_denied(callback: CallbackQuery) -> None:
         await callback.answer("Доступ закрыт: нужны права админа 🙅", show_alert=True)
+
+    @denied.message(
+        Command("admin", "rehash", "rehash_stop"), F.chat.type == "private"
+    )
+    async def admin_command_denied(message: Message) -> None:
+        # у бывшего админа /admin не должен умирать молча
+        await message.answer("Доступ закрыт: нужны права админа 🙅")
 
     root = Router(name="admin_root")
     root.include_router(admin)

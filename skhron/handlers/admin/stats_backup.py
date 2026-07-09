@@ -3,7 +3,10 @@
 import asyncio
 import html
 import logging
-from datetime import datetime
+import sqlite3
+import tempfile
+from contextlib import suppress
+from pathlib import Path
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -21,6 +24,7 @@ from skhron.config import Config
 from skhron.db import repo
 from skhron.keyboards.callbacks import AdminCB
 from skhron.services.dedup import compute_phash_from_file
+from skhron.utils.dates import now_local_str
 from skhron.utils.media import MEDIA_TYPE_LABELS
 
 logger = logging.getLogger(__name__)
@@ -94,19 +98,40 @@ async def show_stats(callback: CallbackQuery, session: AsyncSession) -> None:
     await callback.answer()
 
 
+def _snapshot_db(src_path: str, dst_path: str) -> None:
+    """Согласованная копия живой SQLite-базы средствами backup API.
+
+    Живой файл слать нельзя: FSInputFile читает его чанками с await между
+    чтениями, и конкурентные коммиты дают «рваную» копию. Блокирующая
+    функция — звать через asyncio.to_thread.
+    """
+    src = sqlite3.connect(src_path)
+    try:
+        dst = sqlite3.connect(dst_path)
+        try:
+            src.backup(dst)
+        finally:
+            dst.close()
+    finally:
+        src.close()
+
+
 @router.callback_query(AdminCB.filter(F.section == "backup"))
 async def send_backup(callback: CallbackQuery, bot: Bot, config: Config) -> None:
     caption = (
-        f"💾 Бэкап Схрона · {datetime.now().strftime('%d.%m.%Y %H:%M')}.\n"
+        f"💾 Бэкап Схрона · {now_local_str()}.\n"
         "Вместе с каналом-архивом это полная резервная копия."
     )
+    tmp_dir = Path(tempfile.mkdtemp(prefix="skhron_backup_"))
+    tmp_file = tmp_dir / "skhron.db"
     try:
+        await asyncio.to_thread(_snapshot_db, config.database_path, str(tmp_file))
         await bot.send_document(
             chat_id=callback.from_user.id,
-            document=FSInputFile(config.database_path),
+            document=FSInputFile(tmp_file, filename="skhron.db"),
             caption=caption,
         )
-    except (TelegramAPIError, OSError):
+    except (TelegramAPIError, OSError, sqlite3.Error):
         logger.exception("Не удалось отправить бэкап БД %s", config.database_path)
         await callback.answer(
             "Не получилось отправить бэкап 😔 Проверь, что файл БД на месте, "
@@ -114,6 +139,10 @@ async def send_backup(callback: CallbackQuery, bot: Bot, config: Config) -> None
             show_alert=True,
         )
         return
+    finally:
+        with suppress(OSError):
+            tmp_file.unlink(missing_ok=True)
+            tmp_dir.rmdir()
     await callback.answer("💾 Бэкап улетел!")
 
 
@@ -221,3 +250,15 @@ async def rehash_stop(message: Message) -> None:
         await message.answer("Останавливаю…")
     else:
         await message.answer("Сейчас ничего не считается")
+
+
+async def shutdown_rehash() -> None:
+    """dp.shutdown-хук: гасим фоновый /rehash до закрытия сессии бота.
+
+    emit_shutdown срабатывает раньше bot.session.close() и engine.dispose(),
+    так что воркер успевает отправить «⏹ Остановлено…» по живой сессии.
+    """
+    if _rehash_task and not _rehash_task.done():
+        _rehash_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await _rehash_task

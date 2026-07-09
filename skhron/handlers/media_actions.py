@@ -67,8 +67,15 @@ async def ask_delete(
     config: Config,
 ) -> None:
     media = await repo.get_media(session, callback_data.media_id)
-    if media is None or media.is_deleted:
-        await callback.answer("Уже удалено", show_alert=True)
+    # Единый ответ для «нет файла / удалён / нет доступа к категории» —
+    # как в toggle_favorite: не раскрываем, существует ли файл, и не даём
+    # удалять после полного отзыва доступа
+    if (
+        media is None
+        or media.is_deleted
+        or not await access.can_view(session, user, config, media.category_id)
+    ):
+        await callback.answer("Этот файл уже удалён из Схрона", show_alert=True)
         return
     if not await access.can_delete_media(session, user, config, media.uploaded_by):
         await callback.answer(
@@ -104,8 +111,15 @@ async def confirm_delete(
     config: Config,
 ) -> None:
     media = await repo.get_media(session, callback_data.media_id)
-    if media is None or media.is_deleted:
-        await callback.answer("Уже удалено", show_alert=True)
+    # Единый ответ для «нет файла / удалён / нет доступа к категории» —
+    # как в toggle_favorite: не раскрываем, существует ли файл, и не даём
+    # удалять после полного отзыва доступа
+    if (
+        media is None
+        or media.is_deleted
+        or not await access.can_view(session, user, config, media.category_id)
+    ):
+        await callback.answer("Этот файл уже удалён из Схрона", show_alert=True)
         return
     if not await access.can_delete_media(session, user, config, media.uploaded_by):
         await callback.answer(

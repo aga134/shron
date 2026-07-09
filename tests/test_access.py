@@ -38,16 +38,17 @@ async def test_view_and_upload_are_independent(session, config):
     category = await make_category(session, "мемы")
 
     viewer = await make_user(session, 100)
-    await repo.set_permission(
+    # set_permission -> Permission | None: успешная выдача не-None
+    assert await repo.set_permission(
         session, viewer.id, category.id, can_view=True, can_upload=False
-    )
+    ) is not None
     assert await access.can_view(session, viewer, config, category.id)
     assert not await access.can_upload(session, viewer, config, category.id)
 
     uploader = await make_user(session, 101)
-    await repo.set_permission(
+    assert await repo.set_permission(
         session, uploader.id, category.id, can_view=False, can_upload=True
-    )
+    ) is not None
     assert not await access.can_view(session, uploader, config, category.id)
     assert await access.can_upload(session, uploader, config, category.id)
 
@@ -56,9 +57,9 @@ async def test_archived_category_hidden_even_for_admin(session, config):
     admin = await make_user(session, 1)
     user = await make_user(session, 100)
     category = await make_category(session, "старьё", archived=True)
-    await repo.set_permission(
+    assert await repo.set_permission(
         session, user.id, category.id, can_view=True, can_upload=True
-    )
+    ) is not None
 
     assert not await access.can_view(session, admin, config, category.id)
     assert not await access.can_upload(session, admin, config, category.id)
@@ -73,16 +74,16 @@ async def test_viewable_and_uploadable_categories_filter(session, config):
     cat_foreign = await make_category(session, "чужая")
     cat_archived = await make_category(session, "архивная", archived=True)
 
-    await repo.set_permission(
+    assert await repo.set_permission(
         session, user.id, cat_view_only.id, can_view=True, can_upload=False
-    )
-    await repo.set_permission(
+    ) is not None
+    assert await repo.set_permission(
         session, user.id, cat_full.id, can_view=True, can_upload=True
-    )
+    ) is not None
     # права на архивную есть, но она всё равно скрыта
-    await repo.set_permission(
+    assert await repo.set_permission(
         session, user.id, cat_archived.id, can_view=True, can_upload=True
-    )
+    ) is not None
 
     viewable = await access.viewable_categories(session, user, config)
     assert {c.id for c in viewable} == {cat_view_only.id, cat_full.id}

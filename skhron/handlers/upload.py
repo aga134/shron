@@ -24,6 +24,7 @@ from aiogram.types import (
     InlineKeyboardMarkup,
     Message,
 )
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from skhron.config import Config
@@ -40,6 +41,7 @@ from skhron.keyboards.common import categories_pick_kb, main_menu_kb
 from skhron.services import access
 from skhron.services.archive import archive_copy
 from skhron.services.dedup import PHASH_MAX_DISTANCE, compute_phash_from_message
+from skhron.utils.fsm import clear_state_keep_pending
 from skhron.utils.media import extract_media, media_caption, send_media
 
 router = Router(name="upload")
@@ -179,6 +181,11 @@ async def _save_one(
     return "created", media
 
 
+# Кап отложенных вопросов «похоже на дубль» в FSM data (как у gjumps):
+# без него игнорируемые вопросы копились бы в MemoryStorage бессрочно
+_DUP_CANDIDATES_MAX = 20
+
+
 async def _ask_about_similar(
     bot: Bot,
     chat_id: int,
@@ -186,6 +193,8 @@ async def _ask_about_similar(
     category: Category,
     item: dict,
     existing: Media,
+    *,
+    show_existing: bool = True,
 ) -> None:
     """Показывает найденный похожий файл (без кнопок), затем отдельным
     ТЕКСТОВЫМ сообщением задаёт вопрос с кнопками — edit_text потом работает
@@ -193,19 +202,18 @@ async def _ask_about_similar(
     под коротким уникальным ключом — его заберут хендлеры DupCB. Ключ —
     случайный токен, а не счётчик: после сброса data / рестарта бота
     протухшая кнопка не найдёт ключ и попадёт в ветку «Кнопка устарела»,
-    а не в чужой (новый) файл."""
-    try:
-        await send_media(
-            bot, chat_id, existing, caption=media_caption(existing, category)
-        )
-    except TelegramAPIError:
-        pass  # похожий файл не показался — вопрос всё равно задаём
-    data = await state.get_data()
-    key = secrets.token_urlsafe(4)
-    candidates = data.get("dup_candidates", {})
-    candidates[key] = {**item, "category_id": category.id}
-    await state.update_data(dup_candidates=candidates)
+    а не в чужой (новый) файл.
+
+    show_existing=False — у загружающего нет права просмотра категории
+    (drop-box «только загрузка»): существующий файл НЕ показываем и в тексте
+    вопроса его не раскрываем, но поток «Сохранить всё равно?» работает.
+
+    Кандидат записывается в dup_candidates только ПОСЛЕ успешной отправки
+    вопроса: упавшая отправка не должна оставлять «невидимую» запись без
+    кнопок. Безопасно под SimpleEventIsolation — колбэк кнопки не начнёт
+    обрабатываться, пока текущий хендлер держит per-user lock."""
     title = html.escape(category.title)
+    key = secrets.token_urlsafe(4)
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
@@ -220,16 +228,37 @@ async def _ask_about_similar(
             ]
         ]
     )
-    question = (
-        f"🤔 Очень похоже на этот файл из «{title}» (выше). "
-        "Сохранить твой всё равно?"
-    )
+    if show_existing:
+        try:
+            await send_media(
+                bot, chat_id, existing, caption=media_caption(existing, category)
+            )
+        except TelegramAPIError:
+            pass  # похожий файл не показался — вопрос всё равно задаём
+        question = (
+            f"🤔 Очень похоже на этот файл из «{title}» (выше). "
+            "Сохранить твой всё равно?"
+        )
+    else:
+        question = (
+            f"🤔 Очень похоже на файл, который уже есть в «{title}». "
+            "Сохранить твой всё равно?"
+        )
     try:
         await bot.send_message(chat_id, question, reply_markup=kb)
     except TelegramRetryAfter as e:
-        # flood-лимит: выдерживаем паузу и повторяем один раз
+        # flood-лимит: выдерживаем паузу и повторяем один раз;
+        # вторая ошибка честно уходит наружу — её ловят вызывающие
         await asyncio.sleep(e.retry_after)
         await bot.send_message(chat_id, question, reply_markup=kb)
+    # вопрос отправлен — только теперь фиксируем кандидата
+    data = await state.get_data()
+    candidates = data.get("dup_candidates", {})
+    candidates[key] = {**item, "category_id": category.id}
+    # dict хранит порядок вставки — выкидываем старейших сверх капа
+    while len(candidates) > _DUP_CANDIDATES_MAX:
+        candidates.pop(next(iter(candidates)))
+    await state.update_data(dup_candidates=candidates)
 
 
 async def _edit_question(
@@ -255,7 +284,18 @@ async def menu_upload(
     user: User,
     config: Config,
     is_admin: bool,
+    state: FSMContext,
 ) -> None:
+    current_state = await state.get_state()
+    if current_state not in (
+        None,
+        UploadStates.collecting.state,
+        UploadStates.choosing_category.state,
+    ):
+        # Чужой FSM-диалог (переход по номеру, админка): кнопки UploadPickCB
+        # в нём не работают — не рисуем заведомо мёртвую клавиатуру
+        await callback.answer("Сначала заверши текущее действие 🙂", show_alert=True)
+        return
     cats = await access.uploadable_categories(session, user, config)
     if not cats:
         if is_admin:
@@ -267,6 +307,20 @@ async def menu_upload(
             await callback.answer(
                 "У тебя нет прав на загрузку — попроси админа 🔒", show_alert=True
             )
+        return
+    if current_state == UploadStates.choosing_category.state:
+        # Уже висит вопрос «Куда сохранить?» с pending-пачкой: показываем
+        # тот же выбор, но с РАБОЧИМИ кнопками (UploadPendingPickCB)
+        await _show_screen(
+            callback.message,
+            "Куда сохранить? 📁",
+            categories_pick_kb(
+                cats,
+                make_cb=lambda c: UploadPendingPickCB(category_id=c.id),
+                back_button=_cancel_button(),
+            ),
+        )
+        await callback.answer()
         return
     await _show_screen(
         callback.message,
@@ -309,7 +363,7 @@ async def pick_category_for_pending(
     pending = data.get("pending", [])
 
     if not pending:
-        await state.clear()
+        await clear_state_keep_pending(state)
         await _show_screen(
             callback.message,
             "Хм, файлы потерялись — пришли их ещё раз, пожалуйста 🤔",
@@ -322,23 +376,48 @@ async def pick_category_for_pending(
     data.pop("pending", None)
     await state.set_data(data)
 
+    # Похожий файл нельзя показывать без права просмотра категории
+    # (drop-box «только загрузка»): can_upload не подразумевает can_view
+    show_existing = await access.can_view(session, user, config, category.id)
+
+    # скаляры снимаем заранее: rollback в except протухает ORM-объекты
+    category_id = category.id
+    user_id = user.id
+    title = html.escape(category.title)
+
     saved = 0
     duplicates = 0
     similar = 0
     failed = 0
-    for item in pending:
-        # Ошибка Telegram на одном файле (например, flood-лимит) не должна
-        # ронять хендлер и терять остаток пачки — pending уже изъят из data
+    for index, item in enumerate(pending):
+        # Ошибка Telegram или БД (flood-лимит, гонка IntegrityError)
+        # на одном файле не должна ронять хендлер и терять остаток
+        # пачки — pending уже изъят из data
         try:
             status, existing = await _save_one(
                 bot, session, config, user, category, item
             )
             if status == "similar" and existing is not None:
                 await _ask_about_similar(
-                    bot, item["src_chat_id"], state, category, item, existing
+                    bot,
+                    item["src_chat_id"],
+                    state,
+                    category,
+                    item,
+                    existing,
+                    show_existing=show_existing,
                 )
-        except TelegramAPIError:
+        except (TelegramAPIError, SQLAlchemyError):
+            # rollback оставляет сессию рабочей, но протухает загруженные
+            # объекты — перечитываем их перед следующей итерацией
+            await session.rollback()
             failed += 1
+            category = await repo.get_category(session, category_id)
+            user = await repo.get_user(session, user_id)
+            if category is None or user is None:
+                # категорию/юзера успели удалить — остаток пачки не спасти
+                failed += len(pending) - index - 1
+                break
             continue
         if status == "created":
             saved += 1
@@ -347,15 +426,10 @@ async def pick_category_for_pending(
         else:
             similar += 1
 
-    data = await state.get_data()
-    if data.get("dup_candidates"):
-        # state.clear() стёр бы кандидатов с кнопок «Сохранить всё равно» —
-        # снимаем только состояние, data оставляем
-        await state.set_state(None)
-    else:
-        await state.clear()
+    # pending уже потреблён (сохранён), dup_candidates с живыми кнопками
+    # «Сохранить всё равно» переживают сброс
+    await clear_state_keep_pending(state)
 
-    title = html.escape(category.title)
     text = f"✅ Сохранено {saved} шт. в «{title}»"
     if duplicates:
         text += f", дубликатов: {duplicates}"
@@ -574,12 +648,8 @@ async def collect_media(
     if category is None or not await access.can_upload(
         session, user, config, category.id
     ):
-        if data.get("dup_candidates"):
-            # state.clear() стёр бы отложенные вопросы «похоже на дубль»
-            await state.set_state(None)
-            await state.set_data({"dup_candidates": data["dup_candidates"]})
-        else:
-            await state.clear()
+        # state.clear() стёр бы отложенные вопросы «похоже на дубль»
+        await clear_state_keep_pending(state)
         await message.answer(
             "🔒 Эта категория больше недоступна — загрузку остановил.",
             reply_markup=main_menu_kb(is_admin),
@@ -588,13 +658,28 @@ async def collect_media(
 
     phash = await compute_phash_from_message(bot, message)
     item = _media_item(message, extracted, phash)
-    status, existing = await _save_one(bot, session, config, user, category, item)
+    # снимаем до _save_one: rollback при гонке IntegrityError в add_media
+    # протухает ORM-объекты, и category.title после него недоступен
     title = html.escape(category.title)
+    # без права просмотра категории существующий похожий файл не показываем
+    show_existing = await access.can_view(session, user, config, category.id)
+    status, existing = await _save_one(bot, session, config, user, category, item)
     if status == "similar" and existing is not None:
         # похожий файл не сохраняем и saved_count не увеличиваем — спрашиваем
-        await _ask_about_similar(
-            bot, message.chat.id, state, category, item, existing
-        )
+        try:
+            await _ask_about_similar(
+                bot,
+                message.chat.id,
+                state,
+                category,
+                item,
+                existing,
+                show_existing=show_existing,
+            )
+        except TelegramAPIError:
+            await message.reply(
+                "Не смог задать вопрос про похожий файл — пришли его ещё раз 😕"
+            )
         return
     if status == "duplicate":
         await message.reply(f"⚠️ Это уже есть в «{title}»", reply_markup=_done_kb())
@@ -613,6 +698,16 @@ async def collect_text_hint(message: Message) -> None:
     )
 
 
+@router.message(StateFilter(UploadStates.collecting), F.chat.type == "private")
+async def collect_unsupported_hint(message: Message) -> None:
+    """Не-медиа и не-текст в режиме collecting (документ, стикер и т.п.)."""
+    await message.answer(
+        "Такой тип пока не умею — пришли фото, видео, гифку, "
+        "кружок, войс или аудио",
+        reply_markup=_done_kb(),
+    )
+
+
 # -------- завершение / отмена
 
 
@@ -623,20 +718,35 @@ async def upload_done(
     state: FSMContext,
 ) -> None:
     current_state = await state.get_state()
-    data = await state.get_data()
-    if data.get("dup_candidates"):
-        # state.clear() стёр бы отложенные вопросы «похоже на дубль»
-        await state.set_state(None)
-        await state.set_data({"dup_candidates": data["dup_candidates"]})
-    else:
-        await state.clear()
+    if current_state not in (
+        None,
+        UploadStates.collecting.state,
+        UploadStates.choosing_category.state,
+    ):
+        # Чужой FSM-диалог (переход по номеру, админка): протухшая кнопка
+        # «Готово»/«Отмена» не должна его убивать — как pick_pending_stale
+        await callback.answer("Сначала заверши текущее действие 🙂", show_alert=True)
+        return
 
+    data = await state.get_data()
     if current_state == UploadStates.choosing_category.state:
-        # Отмена выбора категории (поток 2)
+        # Отмена выбора категории (поток 2): pending сознательно выбрасываем,
+        # поэтому НЕ clear_state_keep_pending — он бы восстановил пачку
+        if data.get("dup_candidates"):
+            # state.clear() стёр бы отложенные вопросы «похоже на дубль»
+            await state.set_state(None)
+            await state.set_data({"dup_candidates": data["dup_candidates"]})
+        else:
+            await state.clear()
         text = "Окей, отменил 👌"
-    else:
+    elif current_state == UploadStates.collecting.state:
+        await clear_state_keep_pending(state)
         saved_count = data.get("saved_count", 0)
         text = f"Готово! Сохранено {saved_count} шт. 📦"
+    else:
+        # state=None: протухшая кнопка под старым сообщением — ничего
+        # не чистим (dup_candidates живы) и не пугаем «Сохранено 0 шт.»
+        text = "Эта загрузка уже завершена 👌 Всё сохранённое лежит в Схроне"
 
     await _show_screen(callback.message, text, main_menu_kb(is_admin))
     await callback.answer()
@@ -666,6 +776,16 @@ async def append_pending_media(
     pending = data.get("pending", [])
     pending.append(_media_item(message, extracted, phash))
     await state.update_data(pending=pending)
+
+
+@router.message(
+    StateFilter(UploadStates.choosing_category), F.chat.type == "private", F.text
+)
+async def choosing_category_text_hint(message: Message) -> None:
+    """Текст в ответ на «Куда сохранить?» — категорию словами не выбрать."""
+    await message.answer(
+        "Категорию нужно выбрать кнопкой под вопросом 👆 (или жми ↩️ Отмена)"
+    )
 
 
 @router.message(StateFilter(None), F.chat.type == "private", MEDIA_FILTER)
@@ -709,4 +829,18 @@ async def unsolicited_media(
             make_cb=lambda c: UploadPendingPickCB(category_id=c.id),
             back_button=_cancel_button(),
         ),
+    )
+
+
+# Финальный catch-all в личке: регистрируется САМЫМ ПОСЛЕДНИМ (роутер upload
+# подключается последним, этот хендлер — последний в нём). Известные команды
+# (/start, /menu, /help, /admin, …) матчатся роутерами выше, медиа — хендлером
+# unsolicited_media (StateFilter(None) + MEDIA_FILTER) выше по файлу. Сюда
+# падают «привет» новичка, /random из групповой памяти, документы и стикеры
+# вне состояний — раньше они оставались вообще без ответа.
+@router.message(StateFilter(None), F.chat.type == "private")
+async def private_fallback(message: Message, is_admin: bool) -> None:
+    await message.answer(
+        "Я храню мемы 📦 Пришли фото/видео — сохраню. Или жми /menu",
+        reply_markup=main_menu_kb(is_admin),
     )

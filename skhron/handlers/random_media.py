@@ -123,11 +123,19 @@ async def show_random(
         )
     ]
     # Старые сообщения не удаляем — пусть остаются в чате
-    await send_media(
-        bot,
-        _chat_id(callback),
-        media,
-        caption=media_caption(media, category),
-        reply_markup=media_kb(media.id, deletable=deletable, extra_rows=[more_row]),
-    )
+    try:
+        await send_media(
+            bot,
+            _chat_id(callback),
+            media,
+            caption=media_caption(media, category),
+            reply_markup=media_kb(
+                media.id, deletable=deletable, extra_rows=[more_row]
+            ),
+        )
+    except TelegramAPIError:
+        # 429 от частых «🎲 Ещё» или битый file_id без резервной копии —
+        # не молчим, как в group.py
+        await callback.answer("Не получилось отправить мем 😕", show_alert=True)
+        return
     await callback.answer()

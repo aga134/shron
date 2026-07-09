@@ -24,6 +24,50 @@ async def test_add_media_dedup(session):
     assert duplicate.id == media.id
 
 
+async def test_add_media_survives_cross_user_insert_race(session, monkeypatch):
+    """Гонка по uq_media_cat_file: SELECT «не увидел» строку конкурента,
+    INSERT ловит IntegrityError — add_media возвращает уже существующую
+    запись как дубликат, а не роняет сохранение.
+
+    Настоящую вторую сессию на SQLite в один поток не устроить (второй
+    коммит упёрся бы в файловую блокировку первого), поэтому окно гонки
+    моделируем адресно: строка-дубликат уже в БД, а результат ПЕРВОГО
+    SELECT подменяем на «пусто» — ровно то состояние, которое видит
+    проигравший гонку INSERT.
+    """
+    category = await make_category(session)
+    winner, created = await repo.add_media(
+        session, category.id, "file-w", "uniq-race", "photo", None, 100
+    )
+    assert created
+
+    real_execute = session.execute
+    calls: list[object] = []
+
+    class _EmptyResult:
+        def scalar_one_or_none(self):
+            return None
+
+    async def racy_execute(stmt, *args, **kwargs):
+        calls.append(stmt)
+        if len(calls) == 1:
+            return _EmptyResult()  # дубликат ещё «не виден»
+        return await real_execute(stmt, *args, **kwargs)
+
+    monkeypatch.setattr(session, "execute", racy_execute)
+
+    loser, created_again = await repo.add_media(
+        session, category.id, "file-l", "uniq-race", "photo", None, 200
+    )
+    assert created_again is False
+    assert loser.id == winner.id
+    # запись победителя гонки не перезаписана проигравшим
+    assert loser.file_id == "file-w"
+    assert loser.uploaded_by == 100
+    # после IntegrityError был повторный SELECT существующей строки
+    assert len(calls) >= 2
+
+
 async def test_add_media_restores_soft_deleted_duplicate(session):
     category = await make_category(session)
     media, _ = await repo.add_media(
@@ -67,6 +111,8 @@ async def test_delete_category_scrubs_invites(session):
     invite_only_b = await repo.create_invite(
         session, [cat_b.id], can_upload=False, max_uses=0, created_by=1
     )
+    assert invite_both is not None
+    assert invite_only_b is not None
 
     await repo.delete_category(session, cat_b.id)
 
@@ -77,6 +123,45 @@ async def test_delete_category_scrubs_invites(session):
     # инвайт, ссылавшийся только на удалённую категорию, опустел и деактивирован
     assert repo.invite_category_ids(invite_only_b) == []
     assert invite_only_b.is_active is False
+
+
+# ------------------------------------------------------------- permissions
+
+
+async def test_set_permission_returns_permission_on_success(session):
+    user = await make_user(session, 100)
+    category = await make_category(session)
+
+    perm = await repo.set_permission(
+        session, user.id, category.id, can_view=True, can_upload=True, granted_by=1
+    )
+    assert perm is not None
+    assert (perm.user_id, perm.category_id) == (user.id, category.id)
+    assert perm.can_view is True
+    assert perm.can_upload is True
+
+    # частичный апдейт: не переданные флаги не трогаются
+    updated = await repo.set_permission(session, user.id, category.id, can_upload=False)
+    assert updated is not None
+    assert updated.can_view is True
+    assert updated.can_upload is False
+
+
+async def test_set_permission_returns_none_for_deleted_category(session):
+    """Категорию успели удалить параллельно — вместо IntegrityError
+    наружу отдаётся None, мусорной записи в БД не остаётся."""
+    user = await make_user(session, 100)
+    # копируем id до вызова: rollback внутри set_permission экспайрит
+    # объекты сессии, и ленивый доступ к user.id из sync-контекста упал бы
+    user_id = user.id
+    category = await make_category(session, "обречённая")
+    doomed_id = category.id
+    await repo.delete_category(session, doomed_id)
+
+    perm = await repo.set_permission(session, user_id, doomed_id, can_view=True)
+
+    assert perm is None
+    assert await repo.get_permission(session, user_id, doomed_id) is None
 
 
 # ---------------------------------------------------------------- random
@@ -131,6 +216,23 @@ async def test_get_feed_item_offset_out_of_bounds(session):
     assert total == 1
 
 
+async def test_get_feed_item_huge_offset_is_clamped(session):
+    """Поддельный offset за пределами int64 не роняет SQLite (OverflowError),
+    а честно возвращает (None, total)."""
+    category = await make_category(session)
+    newest = await make_media(session, category.id, uploaded_by=100)
+
+    media, total = await repo.get_feed_item(session, category.id, 10**20)
+    assert media is None
+    assert total == 1
+
+    # отрицательный offset клампится к нулю — самый свежий элемент
+    media, total = await repo.get_feed_item(session, category.id, -(10**20))
+    assert media is not None
+    assert media.id == newest.id
+    assert total == 1
+
+
 async def test_get_feed_item_skips_deleted(session):
     category = await make_category(session)
     kept = await make_media(session, category.id, uploaded_by=100)
@@ -176,7 +278,61 @@ async def test_get_favorite_item_filters_by_viewable_ids(session):
     assert total == 0
 
 
+async def test_get_favorite_item_huge_offset_is_clamped(session):
+    """Поддельный offset за пределами int64 не роняет SQLite (OverflowError),
+    а честно возвращает (None, total)."""
+    user = await make_user(session, 100)
+    category = await make_category(session)
+    newest = await make_media(session, category.id, uploaded_by=user.id)
+    await repo.toggle_favorite(session, user.id, newest.id)
+
+    item, total = await repo.get_favorite_item(
+        session, user.id, [category.id], 10**20
+    )
+    assert item is None
+    assert total == 1
+
+    # отрицательный offset клампится к нулю — самый свежий элемент
+    item, total = await repo.get_favorite_item(
+        session, user.id, [category.id], -(10**20)
+    )
+    assert item is not None
+    assert item.id == newest.id
+    assert total == 1
+
+
 # ---------------------------------------------------------------- invites
+
+
+async def test_create_invite_returns_none_when_all_categories_deleted(session):
+    """Все выбранные категории удалили до «Создать» — инвайт не создаётся."""
+    category = await make_category(session, "обречённая")
+    doomed_id = category.id
+    await repo.delete_category(session, doomed_id)
+
+    invite = await repo.create_invite(
+        session, [doomed_id], can_upload=True, max_uses=0, created_by=1
+    )
+
+    assert invite is None
+    # откат: мусорной строки в invites не осталось
+    assert await repo.list_invites(session, active_only=False) == []
+
+
+async def test_create_invite_trims_deleted_categories_from_csv(session):
+    """Удалённые категории вычищаются из CSV, живые остаются."""
+    alive = await make_category(session, "живая")
+    doomed = await make_category(session, "под снос")
+    doomed_id = doomed.id
+    await repo.delete_category(session, doomed_id)
+
+    invite = await repo.create_invite(
+        session, [alive.id, doomed_id], can_upload=True, max_uses=0, created_by=1
+    )
+
+    assert invite is not None
+    assert repo.invite_category_ids(invite) == [alive.id]
+    assert invite.is_active is True
 
 
 async def test_redeem_invite_grants_view_and_upload(session):
@@ -185,6 +341,7 @@ async def test_redeem_invite_grants_view_and_upload(session):
     invite = await repo.create_invite(
         session, [category.id], can_upload=True, max_uses=0, created_by=1
     )
+    assert invite is not None
 
     granted = await repo.redeem_invite(session, invite, user.id)
     assert [c.id for c in granted] == [category.id]
@@ -203,6 +360,7 @@ async def test_redeem_invite_view_only(session):
     invite = await repo.create_invite(
         session, [category.id], can_upload=False, max_uses=0, created_by=1
     )
+    assert invite is not None
 
     granted = await repo.redeem_invite(session, invite, user.id)
     assert granted
@@ -216,12 +374,14 @@ async def test_redeem_invite_does_not_downgrade_upload(session):
     user = await make_user(session, 100)
     category = await make_category(session)
     # у юзера уже есть can_upload (но нет view)
-    await repo.set_permission(
+    seeded = await repo.set_permission(
         session, user.id, category.id, can_view=False, can_upload=True
     )
+    assert seeded is not None
     invite = await repo.create_invite(
         session, [category.id], can_upload=False, max_uses=0, created_by=1
     )
+    assert invite is not None
 
     granted = await repo.redeem_invite(session, invite, user.id)
     assert granted
@@ -238,6 +398,7 @@ async def test_redeem_invite_max_uses_and_deactivation(session):
     invite = await repo.create_invite(
         session, [category.id], can_upload=False, max_uses=1, created_by=1
     )
+    assert invite is not None
 
     granted = await repo.redeem_invite(session, invite, first.id)
     assert granted
@@ -255,6 +416,7 @@ async def test_redeem_invite_repeat_by_same_user_is_idempotent(session):
     invite = await repo.create_invite(
         session, [category.id], can_upload=True, max_uses=2, created_by=1
     )
+    assert invite is not None
 
     first = await repo.redeem_invite(session, invite, user.id)
     assert [c.id for c in first] == [category.id]
@@ -279,6 +441,7 @@ async def test_redeem_inactive_invite_returns_nothing(session):
     invite = await repo.create_invite(
         session, [category.id], can_upload=True, max_uses=0, created_by=1
     )
+    assert invite is not None
     await repo.deactivate_invite(session, invite.id)
 
     assert await repo.redeem_invite(session, invite, user.id) == []

@@ -12,6 +12,7 @@ from aiogram.types import (
 )
 
 from skhron.keyboards.callbacks import AdminCB, MenuCB
+from skhron.utils.fsm import clear_state_keep_pending
 
 router = Router(name="admin_panel")
 
@@ -87,20 +88,21 @@ async def show_text_screen(
 
 @router.message(Command("admin"), F.chat.type == "private")
 async def cmd_admin(message: Message, state: FSMContext) -> None:
-    await state.clear()
+    await clear_state_keep_pending(state)
     await message.answer(ADMIN_HOME_TEXT, reply_markup=admin_home_kb())
 
 
 @router.callback_query(MenuCB.filter(F.action == "admin"))
 async def admin_from_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await state.clear()
+    await clear_state_keep_pending(state)
     await show_text_screen(callback, ADMIN_HOME_TEXT, admin_home_kb())
     await callback.answer()
 
 
 @router.callback_query(AdminCB.filter(F.section == "home"))
 async def admin_home(callback: CallbackQuery, state: FSMContext) -> None:
-    # Кнопки «назад/отмена» ведут сюда — чистим возможное FSM-состояние
-    await state.clear()
+    # Кнопки «назад/отмена» ведут сюда — чистим возможное FSM-состояние,
+    # не теряя данные живых кнопок (pending/dup_candidates)
+    await clear_state_keep_pending(state)
     await show_text_screen(callback, ADMIN_HOME_TEXT, admin_home_kb())
     await callback.answer()
