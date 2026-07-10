@@ -659,7 +659,7 @@ async def migrate_chat(session: AsyncSession, old_id: int, new_id: int) -> None:
         # расписание «мема дня» переезжает, если у новой записи его нет
         if new.daily_minutes is None and old.daily_minutes is not None:
             new.daily_minutes = old.daily_minutes
-            new.daily_last_sent = old.daily_last_sent
+            new.daily_last_sent = new.daily_last_sent or old.daily_last_sent
     existing_ids = {
         p.category_id
         for p in (

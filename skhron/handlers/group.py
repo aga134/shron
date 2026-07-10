@@ -701,11 +701,11 @@ async def group_save_pick(
             await message.edit_text(result)
         except TelegramAPIError:
             pass
-    # тост — plain text (HTML-entities убираем) и не длиннее 200 символов:
-    # длинные названия категорий иначе роняют answerCallbackQuery
+    # тост — plain text (HTML-entities убираем); лимит answerCallbackQuery —
+    # 200 UTF-16 code units (астральные эмодзи считаются за два)
     toast = html.unescape(result)
-    if len(toast) > 200:
-        toast = toast[:199] + "…"
+    if len(toast.encode("utf-16-le")) // 2 > 200:
+        toast = toast[:99] + "…"
     await callback.answer(toast)
 
 
