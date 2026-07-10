@@ -19,7 +19,6 @@ from skhron.db.models import (
     Favorite,
     GroupPermission,
     Invite,
-    Like,
     Media,
     Permission,
     User,
@@ -455,19 +454,24 @@ async def get_feed_item(
 async def get_favorite_item(
     session: AsyncSession,
     user_id: int,
-    viewable_category_ids: list[int],
     offset: int,
 ) -> tuple[Media | None, int]:
-    """Лента избранного: только из доступных пользователю категорий."""
-    if not viewable_category_ids:
-        return None, 0
+    """Лента избранного: (элемент на позиции offset, всего).
+
+    Личные права категорий НЕ фильтруются: в избранное попадает только то,
+    что юзер легально видел в момент нажатия ⭐️ (личка — по личным правам,
+    группа — по групповым), и «у него это будет», даже если доступ потом
+    отозвали. Архивные категории скрыты (архив прячет контент ото всех),
+    мягко удалённые записи тоже.
+    """
     base = (
         select(Media)
         .join(Favorite, Favorite.media_id == Media.id)
+        .join(Category, Category.id == Media.category_id)
         .where(
             Favorite.user_id == user_id,
             Media.is_deleted.is_(False),
-            Media.category_id.in_(viewable_category_ids),
+            Category.is_archived.is_(False),
         )
     )
     total = (
@@ -507,81 +511,21 @@ async def is_favorite(session: AsyncSession, user_id: int, media_id: int) -> boo
     return await session.get(Favorite, (user_id, media_id)) is not None
 
 
-# ---------------------------------------------------------------- likes
-
-
-async def toggle_like(
-    session: AsyncSession, user_id: int, media_id: int
-) -> tuple[bool, int]:
-    """(поставили ли лайк, актуальный счётчик лайков записи)."""
-    like = await session.get(Like, (user_id, media_id))
-    if like is None:
-        session.add(Like(user_id=user_id, media_id=media_id))
-        try:
-            await session.commit()
-        except IntegrityError:
-            # двойной тап: параллельный апдейт уже вставил запись
-            await session.rollback()
-        liked = True
-    else:
-        await session.delete(like)
-        await session.commit()
-        liked = False
-    return liked, await like_count(session, media_id)
-
-
-async def like_count(session: AsyncSession, media_id: int) -> int:
-    stmt = select(func.count()).select_from(Like).where(Like.media_id == media_id)
-    return (await session.execute(stmt)).scalar_one()
-
-
-async def get_liked_item(
-    session: AsyncSession, user_id: int, offset: int
-) -> tuple[Media | None, int]:
-    """Лента лайкнутого юзером: (элемент на позиции offset, всего).
-
-    Без фильтра по личным правам: всё в этом списке юзер уже видел
-    в группе, когда лайкал. Но архивные категории скрыты — как и везде
-    (архив прячет контент ото всех), — и мягко удалённые записи тоже.
-    """
-    base = (
-        select(Media)
-        .join(Like, Like.media_id == Media.id)
-        .join(Category, Category.id == Media.category_id)
-        .where(
-            Like.user_id == user_id,
-            Media.is_deleted.is_(False),
-            Category.is_archived.is_(False),
-        )
-    )
-    total = (
-        await session.execute(select(func.count()).select_from(base.subquery()))
-    ).scalar_one()
-    offset = max(0, min(offset, total))
-    stmt = (
-        base.order_by(Like.created_at.desc(), Media.id.desc())
-        .offset(offset)
-        .limit(1)
-    )
-    media = (await session.execute(stmt)).scalar_one_or_none()
-    return media, total
-
-
-async def top_liked(
+async def top_favorited(
     session: AsyncSession, category_ids: list[int], limit: int = 5
 ) -> list[tuple[Media, int]]:
-    """Топ записей по лайкам в заданных категориях (для /top в группе)."""
+    """Топ записей по числу добавлений в избранное (для /top в группе)."""
     if not category_ids:
         return []
     stmt = (
-        select(Media, func.count(Like.user_id).label("likes"))
-        .join(Like, Like.media_id == Media.id)
+        select(Media, func.count(Favorite.user_id).label("stars"))
+        .join(Favorite, Favorite.media_id == Media.id)
         .where(
             Media.category_id.in_(category_ids),
             Media.is_deleted.is_(False),
         )
         .group_by(Media.id)
-        .order_by(func.count(Like.user_id).desc(), Media.created_at.desc())
+        .order_by(func.count(Favorite.user_id).desc(), Media.created_at.desc())
         .limit(limit)
     )
     return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]

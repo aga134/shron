@@ -292,23 +292,25 @@ async def test_toggle_favorite_roundtrip(session):
     assert not await repo.is_favorite(session, user.id, media.id)
 
 
-async def test_get_favorite_item_filters_by_viewable_ids(session):
+async def test_get_favorite_item_does_not_filter_by_permissions(session):
+    """Лента избранного НЕ фильтруется личными правами: звезда ставится
+    там, где юзер легально видел мем (личка или группа), — этого
+    достаточно, «у него это будет» даже без доступа к категории."""
     user = await make_user(session, 100)
-    cat_visible = await make_category(session, "доступная")
-    cat_hidden = await make_category(session, "недоступная")
-    media_visible = await make_media(session, cat_visible.id, uploaded_by=user.id)
-    media_hidden = await make_media(session, cat_hidden.id, uploaded_by=user.id)
+    cat_granted = await make_category(session, "доступная")
+    cat_foreign = await make_category(session, "недоступная")
+    media_granted = await make_media(session, cat_granted.id, uploaded_by=user.id)
+    media_foreign = await make_media(session, cat_foreign.id, uploaded_by=user.id)
 
-    await repo.toggle_favorite(session, user.id, media_visible.id)
-    await repo.toggle_favorite(session, user.id, media_hidden.id)
+    await repo.toggle_favorite(session, user.id, media_granted.id)
+    await repo.toggle_favorite(session, user.id, media_foreign.id)
 
-    item, total = await repo.get_favorite_item(session, user.id, [cat_visible.id], 0)
-    assert total == 1
-    assert item.id == media_visible.id
-
-    item, total = await repo.get_favorite_item(session, user.id, [], 0)
-    assert item is None
-    assert total == 0
+    seen: set[int] = set()
+    for offset in range(2):
+        item, total = await repo.get_favorite_item(session, user.id, offset)
+        assert total == 2  # «чужая» категория тоже в ленте и в счётчике
+        seen.add(item.id)
+    assert seen == {media_granted.id, media_foreign.id}
 
 
 async def test_get_favorite_item_huge_offset_is_clamped(session):
@@ -319,16 +321,12 @@ async def test_get_favorite_item_huge_offset_is_clamped(session):
     newest = await make_media(session, category.id, uploaded_by=user.id)
     await repo.toggle_favorite(session, user.id, newest.id)
 
-    item, total = await repo.get_favorite_item(
-        session, user.id, [category.id], 10**20
-    )
+    item, total = await repo.get_favorite_item(session, user.id, 10**20)
     assert item is None
     assert total == 1
 
     # отрицательный offset клампится к нулю — самый свежий элемент
-    item, total = await repo.get_favorite_item(
-        session, user.id, [category.id], -(10**20)
-    )
+    item, total = await repo.get_favorite_item(session, user.id, -(10**20))
     assert item is not None
     assert item.id == newest.id
     assert total == 1

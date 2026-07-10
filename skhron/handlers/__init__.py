@@ -8,7 +8,6 @@ def setup_routers() -> Router:
         feed,
         group,
         inline_mode,
-        liked,
         media_actions,
         menu,
         random_media,
@@ -25,7 +24,6 @@ def setup_routers() -> Router:
     root.include_router(random_media.router)
     root.include_router(feed.router)
     root.include_router(favorites.router)
-    root.include_router(liked.router)
     # group — до upload: его команды ходят только в группах,
     # с private-хендлерами других модулей не конфликтуют
     root.include_router(group.router)

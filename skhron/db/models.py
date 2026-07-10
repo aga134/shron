@@ -94,26 +94,11 @@ class Permission(Base):
 
 
 class Favorite(Base):
+    """Личное избранное. Пополняется и из лички (⭐️ под медиа), и из групп
+    (⭐️ под групповыми постами): раз юзер легально видел мем, он остаётся
+    у него в избранном даже без личного доступа к категории."""
+
     __tablename__ = "favorites"
-
-    user_id: Mapped[int] = mapped_column(
-        ForeignKey("users.id", ondelete="CASCADE"), primary_key=True
-    )
-    media_id: Mapped[int] = mapped_column(
-        ForeignKey("media.id", ondelete="CASCADE"), primary_key=True
-    )
-    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
-
-
-class Like(Base):
-    """Лайки в группах: один юзер — один лайк на запись media.
-
-    Привязан к записи БД, а не к сообщению: та же картинка, показанная
-    в разные дни разными постами, лайкается один раз. Снятие — повторным
-    нажатием. Отдельная сущность от Favorite (личное избранное в личке).
-    """
-
-    __tablename__ = "likes"
 
     user_id: Mapped[int] = mapped_column(
         ForeignKey("users.id", ondelete="CASCADE"), primary_key=True

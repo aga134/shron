@@ -33,7 +33,7 @@ GROUP_COMMANDS = [
     BotCommand(command="random", description="Случайный мем"),
     BotCommand(command="feed", description="Лента категории"),
     BotCommand(command="save", description="Сохранить мем (ответом на него)"),
-    BotCommand(command="top", description="Топ мемов группы по лайкам"),
+    BotCommand(command="top", description="Топ мемов группы по звёздочкам"),
     BotCommand(command="categories", description="Что открыто этой группе"),
 ]
 

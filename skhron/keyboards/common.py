@@ -31,7 +31,6 @@ def main_menu_kb(is_admin: bool) -> InlineKeyboardMarkup:
     builder.button(text="🎲 Рандом", callback_data=MenuCB(action="random"))
     builder.button(text="📼 Лента", callback_data=MenuCB(action="feed"))
     builder.button(text="⭐️ Избранное", callback_data=MenuCB(action="favorites"))
-    builder.button(text="❤️ Лайкнутое", callback_data=MenuCB(action="liked"))
     builder.button(text="📤 Загрузить", callback_data=MenuCB(action="upload"))
     if INLINE_ENABLED:
         # открывает инлайн-режим прямо в этом чате: сетка превью + поиск
@@ -40,7 +39,7 @@ def main_menu_kb(is_admin: bool) -> InlineKeyboardMarkup:
     builder.button(text="ℹ️ Помощь", callback_data=MenuCB(action="help"))
     if is_admin:
         builder.button(text="🛠 Админка", callback_data=MenuCB(action="admin"))
-    builder.adjust(2, 2, 2, 2, 1)
+    builder.adjust(2, 2, 2, 1, 1)
     return builder.as_markup()
 
 

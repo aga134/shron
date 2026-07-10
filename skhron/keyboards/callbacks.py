@@ -5,7 +5,7 @@ from aiogram.filters.callback_data import CallbackData
 
 
 class MenuCB(CallbackData, prefix="menu"):
-    # home | random | feed | favorites | liked | upload | access | admin | help
+    # home | random | feed | favorites | upload | access | admin | help
     action: str
 
 
@@ -30,7 +30,8 @@ class FavPageCB(CallbackData, prefix="favp"):
 
 
 class MediaActionCB(CallbackData, prefix="ma"):
-    # fav — в/из избранного; del — запрос удаления;
+    # fav — в/из избранного; favc/favx — подтвердить/отменить снятие ⭐️
+    # без личного доступа (оно необратимо); del — запрос удаления;
     # delc — подтвердить удаление; delx — отменить удаление;
     # cap — изменить подпись; capx — отменить изменение подписи
     action: str
@@ -90,15 +91,18 @@ class GroupRandomCB(CallbackData, prefix="grnd"):
     category_id: int
 
 
-class GroupLikeCB(CallbackData, prefix="glike"):
-    # лайк под медиа-постом бота В ГРУППЕ: тоггл per (user, media),
-    # счётчик на кнопке; права проверяются по chat_id сообщения
+class GroupFavCB(CallbackData, prefix="gfav"):
+    # ⭐️ под медиа-постом бота В ГРУППЕ: тоггл личного избранного;
+    # права проверяются по chat_id сообщения. Добавленное из группы видно
+    # юзеру в личке даже без личного доступа к категории
     media_id: int
 
 
-class LikedPageCB(CallbackData, prefix="likedp"):
-    # личная лента лайкнутого; offset=-1 — ввод номера, -2 — отмена ввода
-    offset: int
+class LegacyGroupLikeCB(CallbackData, prefix="glike"):
+    # СОВМЕСТИМОСТЬ: кнопки «❤️ N» эпохи лайков на уже отправленных постах.
+    # Новые клавиатуры этой фабрикой не строятся; нажатия обслуживает тот же
+    # хендлер, что и GroupFavCB (лайки смигрированы в избранное)
+    media_id: int
 
 
 class GroupSaveCB(CallbackData, prefix="gsave"):

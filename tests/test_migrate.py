@@ -1,4 +1,5 @@
-"""Тесты pre_migrate: пересборка media с AUTOINCREMENT (skhron/db/migrate.py).
+"""Тесты pre_migrate (skhron/db/migrate.py): пересборка media с
+AUTOINCREMENT и перенос устаревших лайков в избранное.
 
 Работает с реальным sqlite3-файлом со СТАРОЙ схемой: media без AUTOINCREMENT,
 phash дописан ALTER-ом (последняя колонка), плюс favorites-строка на media.
@@ -252,3 +253,89 @@ def test_pre_migrate_missing_file_is_noop(tmp_path):
     missing = tmp_path / "no-such.db"
     pre_migrate(str(missing))  # не бросает
     assert not missing.exists()  # и не создаёт пустую БД
+
+
+# --------------------------------------------------- likes -> favorites
+
+# Схема likes, какой её создавал create_all до замены лайков избранным
+_LIKES_DDL = """
+CREATE TABLE likes (
+    user_id BIGINT NOT NULL,
+    media_id INTEGER NOT NULL,
+    created_at DATETIME NOT NULL,
+    PRIMARY KEY (user_id, media_id),
+    FOREIGN KEY(user_id) REFERENCES users (id) ON DELETE CASCADE,
+    FOREIGN KEY(media_id) REFERENCES media (id) ON DELETE CASCADE
+)
+"""
+
+
+def _table_exists(con: sqlite3.Connection, name: str) -> bool:
+    return (
+        con.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name=?",
+            (name,),
+        ).fetchone()
+        is not None
+    )
+
+
+def test_pre_migrate_merges_likes_into_favorites(old_db):
+    con = sqlite3.connect(old_db)
+    try:
+        con.execute(_LIKES_DDL)
+        # лайк (100, 1) дублирует уже существующую звёздочку из фикстуры,
+        # лайк (100, 2) — новый и должен переехать в favorites
+        con.execute("INSERT INTO likes VALUES (100, 1, '2024-05-05 09:00:00')")
+        con.execute("INSERT INTO likes VALUES (100, 2, '2024-06-06 10:00:00')")
+        con.commit()
+    finally:
+        con.close()
+
+    pre_migrate(old_db)
+
+    con = sqlite3.connect(old_db)
+    try:
+        # таблица likes исчезла из sqlite_master
+        assert not _table_exists(con, "likes")
+        # обе записи в favorites; дубль схлопнулся (INSERT OR IGNORE),
+        # существующая звёздочка сохранила свой created_at
+        assert con.execute(
+            "SELECT user_id, media_id, created_at FROM favorites"
+            " ORDER BY media_id"
+        ).fetchall() == [
+            (100, 1, "2024-03-03 12:00:00"),
+            (100, 2, "2024-06-06 10:00:00"),
+        ]
+        # чужие данные целы
+        assert con.execute(_SELECT_MEDIA).fetchall() == _MEDIA_ROWS
+        assert con.execute("SELECT id, username FROM users").fetchall() == [
+            (100, "vasya")
+        ]
+        assert con.execute("SELECT id, title FROM categories").fetchall() == [
+            (1, "мемы")
+        ]
+        assert con.execute("PRAGMA foreign_key_check").fetchall() == []
+
+        master_before = con.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall()
+        favorites_before = con.execute(
+            "SELECT * FROM favorites ORDER BY media_id"
+        ).fetchall()
+    finally:
+        con.close()
+
+    pre_migrate(old_db)  # повторный вызов — no-op
+
+    con = sqlite3.connect(old_db)
+    try:
+        assert not _table_exists(con, "likes")
+        assert con.execute(
+            "SELECT type, name, sql FROM sqlite_master ORDER BY type, name"
+        ).fetchall() == master_before
+        assert con.execute(
+            "SELECT * FROM favorites ORDER BY media_id"
+        ).fetchall() == favorites_before
+    finally:
+        con.close()

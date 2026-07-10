@@ -39,12 +39,32 @@ _MEDIA_COLS = (
 )
 
 
+def _merge_likes_into_favorites(con: sqlite3.Connection) -> None:
+    """Лайки заменены избранным (2026-07): переносим их без потерь и
+    убираем таблицу. Дубли (лайк + уже существующая звёздочка) молча
+    схлопываются."""
+    row = con.execute(
+        "SELECT name FROM sqlite_master WHERE type='table' AND name='likes'"
+    ).fetchone()
+    if row is None:
+        return
+    logger.info("Миграция: переносим лайки в избранное и убираем likes")
+    with con:
+        con.execute(
+            "INSERT OR IGNORE INTO favorites (user_id, media_id, created_at) "
+            "SELECT user_id, media_id, created_at FROM likes"
+        )
+        con.execute("DROP TABLE likes")
+
+
 def pre_migrate(database_path: str) -> None:
-    """Пересобирает media с AUTOINCREMENT, если таблица создана без него."""
+    """Пересобирает media с AUTOINCREMENT, если таблица создана без него,
+    и переносит устаревшие лайки в избранное."""
     if not os.path.exists(database_path):
         return
     con = sqlite3.connect(database_path)
     try:
+        _merge_likes_into_favorites(con)
         row = con.execute(
             "SELECT sql FROM sqlite_master WHERE type='table' AND name='media'"
         ).fetchone()

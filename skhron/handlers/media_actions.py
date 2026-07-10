@@ -66,12 +66,107 @@ async def toggle_favorite(
     if media is None or media.is_deleted:
         await callback.answer("Этот файл уже удалён из Схрона", show_alert=True)
         return
-    if not await access.can_view(session, user, config, media.category_id):
-        # то же сообщение, что и для удалённых: не раскрываем, существует ли файл
+    can_view = await access.can_view(session, user, config, media.category_id)
+    is_fav = await repo.is_favorite(session, user.id, media.id)
+    # Ответ для «нет доступа и не в избранном» тот же, что и для удалённых —
+    # не раскрываем, существует ли файл
+    if not can_view and not is_fav:
         await callback.answer("Этот файл уже удалён из Схрона", show_alert=True)
+        return
+    if not can_view and is_fav:
+        # ⭐️ из группы без личного доступа: снятие необратимо (вернуть
+        # звезду из лички не выйдет) — спрашиваем подтверждение
+        message = callback.message
+        if isinstance(message, Message):
+            confirm_row = [
+                InlineKeyboardButton(
+                    text="❌ Точно убрать ⭐️?",
+                    callback_data=MediaActionCB(
+                        action="favc", media_id=media.id
+                    ).pack(),
+                ),
+                InlineKeyboardButton(
+                    text="↩️ Оставить",
+                    callback_data=MediaActionCB(
+                        action="favx", media_id=media.id
+                    ).pack(),
+                ),
+            ]
+            try:
+                await message.edit_reply_markup(
+                    reply_markup=_swap_row(
+                        message.reply_markup,
+                        MediaActionCB(action="fav", media_id=media.id).pack(),
+                        confirm_row,
+                        InlineKeyboardMarkup(inline_keyboard=[confirm_row]),
+                    )
+                )
+            except TelegramAPIError:
+                pass
+        await callback.answer(
+            "Категория тебе больше не открыта: если снимешь ⭐️, "
+            "вернуть её из лички не получится",
+            show_alert=True,
+        )
         return
     added = await repo.toggle_favorite(session, user.id, media.id)
     await callback.answer("⭐️ В избранном!" if added else "Убрано из избранного")
+
+
+def _plain_actions_row(media_id: int) -> list[InlineKeyboardButton]:
+    """Стандартный ряд действий без ✏️/🗑 — для восстановления после
+    подтверждения снятия ⭐️ (прав на удаление тут заведомо нет)."""
+    return media_kb(media_id, deletable=False).inline_keyboard[0]
+
+
+@router.callback_query(MediaActionCB.filter(F.action == "favc"))
+async def confirm_unfavorite(
+    callback: CallbackQuery,
+    callback_data: MediaActionCB,
+    session: AsyncSession,
+    user: User,
+) -> None:
+    if await repo.is_favorite(session, user.id, callback_data.media_id):
+        await repo.toggle_favorite(session, user.id, callback_data.media_id)
+    message = callback.message
+    if isinstance(message, Message):
+        try:
+            await message.edit_reply_markup(
+                reply_markup=_swap_row(
+                    message.reply_markup,
+                    MediaActionCB(
+                        action="favc", media_id=callback_data.media_id
+                    ).pack(),
+                    _plain_actions_row(callback_data.media_id),
+                    media_kb(callback_data.media_id, deletable=False),
+                )
+            )
+        except TelegramAPIError:
+            pass
+    await callback.answer("Убрано из избранного")
+
+
+@router.callback_query(MediaActionCB.filter(F.action == "favx"))
+async def cancel_unfavorite(
+    callback: CallbackQuery,
+    callback_data: MediaActionCB,
+) -> None:
+    message = callback.message
+    if isinstance(message, Message):
+        try:
+            await message.edit_reply_markup(
+                reply_markup=_swap_row(
+                    message.reply_markup,
+                    MediaActionCB(
+                        action="favc", media_id=callback_data.media_id
+                    ).pack(),
+                    _plain_actions_row(callback_data.media_id),
+                    media_kb(callback_data.media_id, deletable=False),
+                )
+            )
+        except TelegramAPIError:
+            pass
+    await callback.answer("⭐️ Оставили на месте")
 
 
 @router.callback_query(MediaActionCB.filter(F.action == "del"))

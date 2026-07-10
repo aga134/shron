@@ -1,4 +1,6 @@
-"""Избранное: листаем сохранённые мемы из доступных категорий."""
+"""Избранное: листаем сохранённые мемы. Личные права категорий не
+фильтруются — юзер легально видел мем в момент нажатия ⭐️ (в личке или
+в группе); архивные категории и удалённые записи скрыты."""
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -27,7 +29,7 @@ router = Router(name="favorites")
 # кнопки личных экранов, пересланные в группу, там не работают
 router.callback_query.filter(PrivateCallback())
 
-EMPTY_TEXT = "В избранном пусто. Жми ⭐️ под любым мемом!"
+EMPTY_TEXT = "В избранном пусто. Жми ⭐️ под любым мемом — в личке или в группе!"
 JUMP_PROMPT = "Напиши номер поста (1–{total}) — перейду к нему 🔢"
 JUMP_CANCELLED_TEXT = "Ок, не переходим 👌"
 NOT_A_NUMBER_TEXT = "Нужен просто номер, например 12"
@@ -134,10 +136,7 @@ async def _show_favorite_item(
     bot: Bot,
     offset: int,
 ) -> None:
-    category_ids = await access.viewable_category_ids(session, user, config)
-    media, total = await repo.get_favorite_item(
-        session, user.id, category_ids, offset
-    )
+    media, total = await repo.get_favorite_item(session, user.id, offset)
     if total == 0:
         await _show_text_screen(callback, bot, EMPTY_TEXT, back_to_menu_kb())
         await callback.answer()
@@ -145,9 +144,7 @@ async def _show_favorite_item(
     if media is None or offset >= total:
         # Избранное сократилось (файлы удалили) — прыгаем на последний элемент
         offset = min(offset, total - 1)
-        media, total = await repo.get_favorite_item(
-            session, user.id, category_ids, offset
-        )
+        media, total = await repo.get_favorite_item(session, user.id, offset)
         if media is None:
             await _show_text_screen(callback, bot, EMPTY_TEXT, back_to_menu_kb())
             await callback.answer()
@@ -166,13 +163,11 @@ async def _start_jump(
     callback: CallbackQuery,
     session: AsyncSession,
     user: User,
-    config: Config,
     bot: Bot,
     state: FSMContext,
 ) -> None:
     """Клик по счётчику «N/M» — включаем режим «жду номер поста»."""
-    category_ids = await access.viewable_category_ids(session, user, config)
-    _, total = await repo.get_favorite_item(session, user.id, category_ids, 0)
+    _, total = await repo.get_favorite_item(session, user.id, 0)
     if total == 0:
         await callback.answer("В избранном пусто 🕸", show_alert=True)
         return
@@ -219,7 +214,9 @@ async def _cancel_jump(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(MenuCB.filter(F.action == "favorites"))
+# "liked" — совместимость: кнопка «❤️ Лайкнутое» на старых сообщениях меню
+# (лайки заменены избранным и смигрированы в него)
+@router.callback_query(MenuCB.filter(F.action.in_({"favorites", "liked"})))
 async def favorites_menu(
     callback: CallbackQuery,
     session: AsyncSession,
@@ -228,6 +225,16 @@ async def favorites_menu(
     bot: Bot,
 ) -> None:
     await _show_favorite_item(callback, session, user, config, bot, offset=0)
+
+
+# Совместимость: стрелки старой ленты «Лайкнутого» (likedp) после замены
+# лайков избранным — подсказываем, куда всё переехало
+@router.callback_query(F.data.startswith("likedp:"))
+async def legacy_liked_page(callback: CallbackQuery) -> None:
+    await callback.answer(
+        "Лайки переехали в ⭐️ Избранное — открой его из меню бота",
+        show_alert=True,
+    )
 
 
 @router.callback_query(FavPageCB.filter())
@@ -244,7 +251,7 @@ async def favorites_page(
     поста; -2 — «↩️ Отмена» под приглашением ввода номера: выйти из режима
     ввода. Остальное — обычная навигация."""
     if callback_data.offset == -1:
-        await _start_jump(callback, session, user, config, bot, state)
+        await _start_jump(callback, session, user, bot, state)
         return
     if callback_data.offset == -2:
         await _cancel_jump(callback, state)
@@ -278,23 +285,20 @@ async def favorites_jump_number(
         return
     num = int(text)
 
-    # Свежий total: избранное (и доступы) могли измениться после клика
-    # по счётчику. Проверяем диапазон ДО запроса с offset=num-1 — заодно
-    # отсекаем отрицательные и гигантские числа
-    category_ids = await access.viewable_category_ids(session, user, config)
-    _, total = await repo.get_favorite_item(session, user.id, category_ids, 0)
+    # Свежий total: избранное могло измениться после клика по счётчику.
+    # Проверяем диапазон ДО запроса с offset=num-1 — заодно отсекаем
+    # отрицательные и гигантские числа
+    _, total = await repo.get_favorite_item(session, user.id, 0)
     if total == 0:
-        # Избранное опустело (или отозвали последний доступ — get_favorite_item
-        # вернёт (None, 0)) — выходим, а не зацикливаем «всего 0 постов»
+        # Избранное опустело (файлы удалили или категории заархивировали) —
+        # выходим, а не зацикливаем «всего 0 постов»
         await clear_state_keep_pending(state)
         await message.answer("В избранном пусто 🕸")
         return
     if num < 1 or num > total:
         await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
         return
-    media, total = await repo.get_favorite_item(
-        session, user.id, category_ids, num - 1
-    )
+    media, total = await repo.get_favorite_item(session, user.id, num - 1)
     if media is None:
         # гонка: избранное сократилось между двумя запросами
         await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
