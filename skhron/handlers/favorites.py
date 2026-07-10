@@ -108,9 +108,11 @@ async def _send_favorite_media(
     Возвращает False, если отправить не получилось (как в group.py).
     """
     category = await repo.get_category(session, media.category_id)
+    # ✏️/🗑 требуют и права удаления, и текущего can_view: иначе под мемом
+    # из «чужой» категории (⭐️ из группы) висели бы мёртвые кнопки
     deletable = await access.can_delete_media(
         session, user, config, media.uploaded_by
-    )
+    ) and await access.can_view(session, user, config, media.category_id)
     try:
         await send_media(
             bot,
