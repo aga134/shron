@@ -21,8 +21,11 @@ from skhron.keyboards.common import back_to_menu_kb, categories_pick_kb, media_k
 from skhron.services import access
 from skhron.utils.fsm import clear_state_keep_pending
 from skhron.utils.media import media_caption, send_media
+from skhron.filters import PrivateCallback
 
 router = Router(name="feed")
+# кнопки личных экранов, пересланные в группу, там не работают
+router.callback_query.filter(PrivateCallback())
 
 PICK_TEXT = (
     "📼 <b>Лента Схрона</b>\n\n"

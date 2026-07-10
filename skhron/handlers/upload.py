@@ -43,8 +43,11 @@ from skhron.services.archive import archive_copy
 from skhron.services.dedup import PHASH_MAX_DISTANCE, compute_phash_from_message
 from skhron.utils.fsm import clear_state_keep_pending
 from skhron.utils.media import extract_media, media_caption, send_media
+from skhron.filters import PrivateCallback
 
 router = Router(name="upload")
+# кнопки личных экранов, пересланные в группу, там не работают
+router.callback_query.filter(PrivateCallback())
 
 # Только медиа, текст не перехватываем
 MEDIA_FILTER = F.photo | F.video | F.animation | F.video_note | F.voice | F.audio

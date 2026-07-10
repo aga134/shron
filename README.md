@@ -16,6 +16,7 @@ A self-hosted Telegram bot for archiving short videos, photos, and memes within 
 - **Group mode** — add the bot to a group chat and grant categories to the group as a whole; members use `/random`, `/feed`, and `/categories` there. Group permissions are independent of personal ones
 - **Save from group** — reply `/save` to any media message in a group to store it; the target category is chosen from the group's categories the sender can personally upload to
 - **Meme of the day** — optional per-group daily post at a configured time (admin panel, Groups section), picked randomly from the group's categories
+- **Likes** — a like button with a counter under every media post the bot sends to groups; one like per user per stored item (toggled off by a second tap), regardless of which message showed it. `/top` lists the group's most-liked items; a private "Liked" section browses everything the user has liked
 - **Captions after the fact** — the uploader or an admin can set or edit an item's caption via an inline button; captions feed the inline search. A Search button in the main menu opens the inline result grid
 - **Admin panel** — in-bot management of categories, users, permissions, groups, invites, and statistics
 - **Archive channel** — optional private channel that receives a copy of every upload; doubles as an automatic fallback source if a `file_id` send ever fails

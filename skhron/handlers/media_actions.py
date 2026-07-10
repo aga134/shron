@@ -21,8 +21,11 @@ from skhron.keyboards.callbacks import MediaActionCB
 from skhron.keyboards.common import back_to_menu_kb, confirm_delete_kb, media_kb
 from skhron.services import access
 from skhron.utils.fsm import clear_state_keep_pending
+from skhron.filters import PrivateCallback
 
 router = Router(name="media_actions")
+# кнопки личных экранов, пересланные в группу, там не работают
+router.callback_query.filter(PrivateCallback())
 
 # Лимит длины подписи: должен помещаться в caption Telegram (1024) вместе
 # со служебной припиской «📁 Категория» при показе медиа

@@ -16,8 +16,11 @@ from skhron.keyboards.callbacks import MenuCB
 from skhron.keyboards.common import back_to_menu_kb, main_menu_kb
 from skhron.services import access
 from skhron.utils.fsm import clear_state_keep_pending
+from skhron.filters import PrivateCallback
 
 router = Router(name="menu")
+# кнопки личных экранов, пересланные в группу, там не работают
+router.callback_query.filter(PrivateCallback())
 
 MENU_TEXT = (
     "🗄 <b>«Схрон» — главное меню</b>\n\n"

@@ -5,7 +5,7 @@ from aiogram.filters.callback_data import CallbackData
 
 
 class MenuCB(CallbackData, prefix="menu"):
-    # home | random | feed | favorites | upload | access | admin | help
+    # home | random | feed | favorites | liked | upload | access | admin | help
     action: str
 
 
@@ -88,6 +88,17 @@ class GroupRandomCB(CallbackData, prefix="grnd"):
     # рандом ИЗ ГРУППЫ: права проверяются по chat_id сообщения;
     # 0 = из всех разрешённых этой группе категорий
     category_id: int
+
+
+class GroupLikeCB(CallbackData, prefix="glike"):
+    # лайк под медиа-постом бота В ГРУППЕ: тоггл per (user, media),
+    # счётчик на кнопке; права проверяются по chat_id сообщения
+    media_id: int
+
+
+class LikedPageCB(CallbackData, prefix="likedp"):
+    # личная лента лайкнутого; offset=-1 — ввод номера, -2 — отмена ввода
+    offset: int
 
 
 class GroupSaveCB(CallbackData, prefix="gsave"):

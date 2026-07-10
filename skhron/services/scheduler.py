@@ -22,7 +22,7 @@ from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 from sqlalchemy.ext.asyncio import async_sessionmaker
 
 from skhron.db import repo
-from skhron.keyboards.callbacks import GroupRandomCB
+from skhron.keyboards.callbacks import GroupLikeCB, GroupRandomCB
 from skhron.services import access
 from skhron.utils.dates import DISPLAY_TZ
 from skhron.utils.media import media_caption, send_media
@@ -57,14 +57,18 @@ async def _daily_loop(bot: Bot, session_factory: async_sessionmaker) -> None:
         await asyncio.sleep(60)
 
 
-def _more_kb() -> InlineKeyboardMarkup:
+def _daily_kb(media_id: int, likes: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="🎲 Ещё",
                     callback_data=GroupRandomCB(category_id=0).pack(),
-                )
+                ),
+                InlineKeyboardButton(
+                    text=f"❤️ {likes}",
+                    callback_data=GroupLikeCB(media_id=media_id).pack(),
+                ),
             ]
         ]
     )
@@ -92,13 +96,14 @@ async def _tick(bot: Bot, session_factory: async_sessionmaker) -> None:
                 await repo.set_chat_daily_sent(session, chat.id, today)
                 continue
             category = await repo.get_category(session, media.category_id)
+            likes = await repo.like_count(session, media.id)
             try:
                 await send_media(
                     bot,
                     chat.id,
                     media,
                     caption="🌅 Мем дня\n\n" + media_caption(media, category),
-                    reply_markup=_more_kb(),
+                    reply_markup=_daily_kb(media.id, likes),
                 )
             except TelegramRetryAfter:
                 # флуд-лимит: не помечаем — попробуем на следующем тике

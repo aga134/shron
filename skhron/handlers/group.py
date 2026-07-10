@@ -1,5 +1,6 @@
 """Работа Схрона в группах: /random, /feed и /categories по правам самой
-группы, /save реплаем — сохранение мема прямо из чата.
+группы, /save реплаем — сохранение мема прямо из чата, лайки ❤️ под
+медиа-постами бота и /top — топ мемов группы по лайкам.
 
 Права на просмотр выдаются админом на группу целиком (в его личной админке),
 личные доступы участников здесь не участвуют — контент видят все.
@@ -8,10 +9,13 @@
 Меню в группах не работает.
 """
 
+import asyncio
 import html
+import time
+from collections import defaultdict
 
 from aiogram import Bot, F, Router
-from aiogram.exceptions import TelegramAPIError
+from aiogram.exceptions import TelegramAPIError, TelegramRetryAfter
 from aiogram.filters import ChatMemberUpdatedFilter, Command
 from aiogram.filters.chat_member_updated import (
     IS_MEMBER,
@@ -38,6 +42,7 @@ from skhron.db.models import Category, User
 from skhron.keyboards.callbacks import (
     GroupFeedCB,
     GroupFeedPickCB,
+    GroupLikeCB,
     GroupRandomCB,
     GroupSaveCB,
 )
@@ -63,23 +68,35 @@ NO_ACCESS_TEXT = (
 )
 
 
-def _more_kb(category_id: int) -> InlineKeyboardMarkup:
-    """Один ряд «🎲 Ещё» — без ⭐️/🗑/меню: в группе им не место."""
+def _like_button(media_id: int, likes: int) -> InlineKeyboardButton:
+    """Кнопка «❤️ N» — тоггл лайка per (user, media)."""
+    return InlineKeyboardButton(
+        text=f"❤️ {likes}",
+        callback_data=GroupLikeCB(media_id=media_id).pack(),
+    )
+
+
+def _more_kb(category_id: int, media_id: int, likes: int) -> InlineKeyboardMarkup:
+    """Один ряд «🎲 Ещё» + «❤️ N» — без ⭐️/🗑/меню: в группе им не место."""
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="🎲 Ещё",
                     callback_data=GroupRandomCB(category_id=category_id).pack(),
-                )
+                ),
+                _like_button(media_id, likes),
             ]
         ]
     )
 
 
-def _feed_nav_kb(category_id: int, offset: int, total: int) -> InlineKeyboardMarkup:
-    """[◀️] [позиция/всего] [▶️]; на краях стрелку не показываем,
-    счётчик всегда есть — клик по нему открывает ввод номера (offset=-1)."""
+def _feed_nav_kb(
+    category_id: int, offset: int, total: int, media_id: int, likes: int
+) -> InlineKeyboardMarkup:
+    """[◀️] [позиция/всего] [▶️] + отдельный ряд «❤️ N»; на краях стрелку
+    не показываем, счётчик всегда есть — клик по нему открывает ввод
+    номера (offset=-1)."""
     row: list[InlineKeyboardButton] = []
     if offset > 0:
         row.append(
@@ -105,7 +122,9 @@ def _feed_nav_kb(category_id: int, offset: int, total: int) -> InlineKeyboardMar
                 ).pack(),
             )
         )
-    return InlineKeyboardMarkup(inline_keyboard=[row])
+    return InlineKeyboardMarkup(
+        inline_keyboard=[row, [_like_button(media_id, likes)]]
+    )
 
 
 def _chat_jump_ctx(bot: Bot, fsm_storage: BaseStorage, chat_id: int) -> FSMContext:
@@ -146,13 +165,14 @@ async def _send_feed_item(
         if media is None:
             return "В категории пусто 🕸"
     category = await repo.get_category(session, media.category_id)
+    likes = await repo.like_count(session, media.id)
     try:
         await send_media(
             bot,
             chat_id,
             media,
             caption=media_caption(media, category),
-            reply_markup=_feed_nav_kb(category_id, offset, total),
+            reply_markup=_feed_nav_kb(category_id, offset, total, media.id, likes),
             message_thread_id=thread_id,
         )
     except TelegramAPIError:
@@ -318,6 +338,78 @@ async def group_feed(message: Message, session: AsyncSession, bot: Bot) -> None:
         )
     # кнопки «⬅️ Меню» нет: это группа, меню тут не работает
     await message.reply("Какую ленту листаем? 📼", reply_markup=builder.as_markup())
+
+
+@router.message(Command("top"), F.chat.type.in_(GROUP_TYPES))
+async def group_top(message: Message, session: AsyncSession, bot: Bot) -> None:
+    """Топ-5 мемов группы по лайкам — из открытых ей категорий."""
+    # кулдаун на группу: каждая выдача — до 6 сообщений, спам командой
+    # быстро упирается во флуд-лимиты Telegram
+    now = time.monotonic()
+    last = _top_cooldowns.get(message.chat.id)
+    if last is not None and now - last < _TOP_COOLDOWN_SECONDS:
+        await message.reply("Топ уже показывал недавно 🙂 Попробуй через минуту")
+        return
+    # отметку ставим ДО отправки: параллельный второй /top отсечётся сразу
+    _top_cooldowns[message.chat.id] = now
+
+    # бот мог попасть в группу до внедрения фичи — регистрируем лениво
+    await repo.upsert_chat(
+        session, message.chat.id, message.chat.title or "", message.chat.type
+    )
+    ids = await access.group_viewable_category_ids(session, message.chat.id)
+    if not ids:
+        await message.reply(NO_ACCESS_TEXT)
+        return
+    top = await repo.top_liked(session, ids, limit=5)
+    if not top:
+        await message.reply("Пока ни одного лайка — жми ❤️ под мемами!")
+        return
+    thread_id = (
+        message.message_thread_id
+        if getattr(message, "is_topic_message", False)
+        else None
+    )
+    try:
+        await message.reply("🏆 Топ мемов группы по лайкам:")
+    except TelegramAPIError:
+        # чат уже под флуд-лимитом — слать пять медиа бессмысленно
+        return
+    for place, (media, count) in enumerate(top, start=1):
+        if place > 1:
+            # пауза между постами, чтобы не влететь во флуд-лимит
+            await asyncio.sleep(0.3)
+        category = await repo.get_category(session, media.category_id)
+        caption = f"#{place} · ❤️ {count}\n\n" + media_caption(media, category)
+        kb = InlineKeyboardMarkup(
+            inline_keyboard=[[_like_button(media.id, count)]]
+        )
+        try:
+            await send_media(
+                bot,
+                message.chat.id,
+                media,
+                caption=caption,
+                reply_markup=kb,
+                message_thread_id=thread_id,
+            )
+        except TelegramRetryAfter as e:
+            # флуд-лимит: ждём, сколько попросили, и пробуем ровно ещё раз
+            await asyncio.sleep(e.retry_after)
+            try:
+                await send_media(
+                    bot,
+                    message.chat.id,
+                    media,
+                    caption=caption,
+                    reply_markup=kb,
+                    message_thread_id=thread_id,
+                )
+            except TelegramAPIError:
+                continue
+        except TelegramAPIError:
+            # битый элемент пропускаем — остальной топ важнее
+            continue
 
 
 # ---------------------------------------------------------------- /save реплаем
@@ -563,6 +655,7 @@ async def group_random_pick(
         if getattr(message, "is_topic_message", False)
         else None
     )
+    likes = await repo.like_count(session, media.id)
     # старые сообщения не удаляем — пусть остаются в чате группы
     try:
         await send_media(
@@ -570,13 +663,108 @@ async def group_random_pick(
             chat.id,
             media,
             caption=media_caption(media, category),
-            reply_markup=_more_kb(callback_data.category_id),
+            reply_markup=_more_kb(callback_data.category_id, media.id, likes),
             message_thread_id=thread_id,
         )
     except TelegramAPIError:
         await callback.answer("Не получилось отправить мем 😕", show_alert=True)
         return
     await callback.answer()
+
+
+# Локи обновления счётчика лайков per сообщение (процесс один — этого
+# достаточно); словарь растёт по локу на лайкнутое сообщение — пустяк
+_like_locks: defaultdict[tuple[int, int], asyncio.Lock] = defaultdict(asyncio.Lock)
+
+# Кулдаун /top per группа: monotonic-время последней выдачи
+_TOP_COOLDOWN_SECONDS = 60
+_top_cooldowns: dict[int, float] = {}
+
+
+def _swap_like_button(
+    markup: InlineKeyboardMarkup | None, new_button: InlineKeyboardButton
+) -> InlineKeyboardMarkup | None:
+    """Аналог _swap_row из media_actions, но меняет ОДНУ кнопку: находит
+    в разметке кнопку с префиксом glike и подставляет новую, сохраняя
+    остальные кнопки ряда («🎲 Ещё», навигацию ленты) и прочие ряды."""
+    if markup is None:
+        return None
+    prefix = GroupLikeCB.__prefix__ + GroupLikeCB.__separator__
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                new_button
+                if (btn.callback_data or "").startswith(prefix)
+                else btn
+                for btn in row
+            ]
+            for row in markup.inline_keyboard
+        ]
+    )
+
+
+@router.callback_query(GroupLikeCB.filter())
+async def group_like(
+    callback: CallbackQuery,
+    callback_data: GroupLikeCB,
+    session: AsyncSession,
+    user: User | None = None,
+) -> None:
+    """Тоггл лайка «❤️ N» под групповым медиа-постом бота.
+
+    Лайк привязан к записи media, а не к сообщению: одна и та же картинка
+    лайкается юзером один раз, из какого бы поста её ни показали.
+    """
+    message = callback.message
+    if message is None:
+        await callback.answer()
+        return
+    # .chat есть и у InaccessibleMessage — этого достаточно
+    chat = message.chat
+    if chat.type not in GROUP_TYPES:
+        await callback.answer("Лайки работают только в группе", show_alert=True)
+        return
+    if user is None:
+        # анонимный админ или отправитель «от имени канала»: middleware
+        # не кладёт user для ботов-масок, а лайк без личности не атрибутировать
+        await callback.answer(
+            "Не вижу, кто лайкает 🙈 Анонимному админу лайки недоступны",
+            show_alert=True,
+        )
+        return
+    media = await repo.get_media(session, callback_data.media_id)
+    if media is None or media.is_deleted:
+        await callback.answer("Этого мема уже нет в Схроне", show_alert=True)
+        return
+    # категория должна быть открыта ИМЕННО этой группе — защита от
+    # пересланных сообщений с кнопкой и поддельных callback_data
+    if not await access.group_can_view(session, chat.id, media.category_id):
+        await callback.answer("Этот мем не из этой группы 🙈", show_alert=True)
+        return
+
+    # лок на сообщение: без него параллельные лайки двух юзеров могут
+    # применить edit_reply_markup в порядке, обратном подсчёту, и кнопка
+    # застынет на устаревшем счётчике
+    message_key = (
+        chat.id,
+        message.message_id if isinstance(message, Message) else 0,
+    )
+    async with _like_locks[message_key]:
+        liked, count = await repo.toggle_like(session, user.id, media.id)
+
+        if isinstance(message, Message):
+            # обновляем счётчик на кнопке нажатого сообщения; остальные посты
+            # с этим же media догонят счётчик при следующем нажатии на них
+            markup = _swap_like_button(
+                message.reply_markup, _like_button(media.id, count)
+            )
+            if markup is not None:
+                try:
+                    await message.edit_reply_markup(reply_markup=markup)
+                except TelegramAPIError:
+                    # включая "message is not modified" — гонка двух кликов
+                    pass
+    await callback.answer("❤️ Лайк!" if liked else "💔 Лайк снят")
 
 
 @router.callback_query(GroupFeedPickCB.filter())
@@ -840,13 +1028,14 @@ async def group_jump_number(
         else None
     )
     category = await repo.get_category(session, media.category_id)
+    likes = await repo.like_count(session, media.id)
     try:
         await send_media(
             bot,
             message.chat.id,
             media,
             caption=media_caption(media, category),
-            reply_markup=_feed_nav_kb(category_id, num - 1, total),
+            reply_markup=_feed_nav_kb(category_id, num - 1, total, media.id, likes),
             message_thread_id=thread_id,
         )
     except TelegramAPIError:

@@ -19,6 +19,7 @@ from skhron.db.models import (
     Favorite,
     GroupPermission,
     Invite,
+    Like,
     Media,
     Permission,
     User,
@@ -504,6 +505,86 @@ async def toggle_favorite(
 
 async def is_favorite(session: AsyncSession, user_id: int, media_id: int) -> bool:
     return await session.get(Favorite, (user_id, media_id)) is not None
+
+
+# ---------------------------------------------------------------- likes
+
+
+async def toggle_like(
+    session: AsyncSession, user_id: int, media_id: int
+) -> tuple[bool, int]:
+    """(поставили ли лайк, актуальный счётчик лайков записи)."""
+    like = await session.get(Like, (user_id, media_id))
+    if like is None:
+        session.add(Like(user_id=user_id, media_id=media_id))
+        try:
+            await session.commit()
+        except IntegrityError:
+            # двойной тап: параллельный апдейт уже вставил запись
+            await session.rollback()
+        liked = True
+    else:
+        await session.delete(like)
+        await session.commit()
+        liked = False
+    return liked, await like_count(session, media_id)
+
+
+async def like_count(session: AsyncSession, media_id: int) -> int:
+    stmt = select(func.count()).select_from(Like).where(Like.media_id == media_id)
+    return (await session.execute(stmt)).scalar_one()
+
+
+async def get_liked_item(
+    session: AsyncSession, user_id: int, offset: int
+) -> tuple[Media | None, int]:
+    """Лента лайкнутого юзером: (элемент на позиции offset, всего).
+
+    Без фильтра по личным правам: всё в этом списке юзер уже видел
+    в группе, когда лайкал. Но архивные категории скрыты — как и везде
+    (архив прячет контент ото всех), — и мягко удалённые записи тоже.
+    """
+    base = (
+        select(Media)
+        .join(Like, Like.media_id == Media.id)
+        .join(Category, Category.id == Media.category_id)
+        .where(
+            Like.user_id == user_id,
+            Media.is_deleted.is_(False),
+            Category.is_archived.is_(False),
+        )
+    )
+    total = (
+        await session.execute(select(func.count()).select_from(base.subquery()))
+    ).scalar_one()
+    offset = max(0, min(offset, total))
+    stmt = (
+        base.order_by(Like.created_at.desc(), Media.id.desc())
+        .offset(offset)
+        .limit(1)
+    )
+    media = (await session.execute(stmt)).scalar_one_or_none()
+    return media, total
+
+
+async def top_liked(
+    session: AsyncSession, category_ids: list[int], limit: int = 5
+) -> list[tuple[Media, int]]:
+    """Топ записей по лайкам в заданных категориях (для /top в группе)."""
+    if not category_ids:
+        return []
+    stmt = (
+        select(Media, func.count(Like.user_id).label("likes"))
+        .join(Like, Like.media_id == Media.id)
+        .where(
+            Media.category_id.in_(category_ids),
+            Media.is_deleted.is_(False),
+        )
+        .group_by(Media.id)
+        .order_by(func.count(Like.user_id).desc(), Media.created_at.desc())
+        .limit(limit)
+    )
+    return [(row[0], row[1]) for row in (await session.execute(stmt)).all()]
 
 
 async def recent_media(

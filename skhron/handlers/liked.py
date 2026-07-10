@@ -1,4 +1,9 @@
-"""Избранное: листаем сохранённые мемы из доступных категорий."""
+"""Лайкнутое: листаем в личке мемы, которым юзер поставил ❤️ в группах.
+
+Лента намеренно НЕ фильтруется по личным правам на категории:
+всё в этом списке юзер уже видел в группе, когда лайкал (get_liked_item).
+Кнопки под постом (⭐️/✏️/🗑) сами перепроверяют права в media_actions.
+"""
 
 from aiogram import Bot, F, Router
 from aiogram.exceptions import TelegramAPIError
@@ -16,25 +21,26 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from skhron.config import Config
 from skhron.db import repo
 from skhron.db.models import Media, User
-from skhron.keyboards.callbacks import FavPageCB, MenuCB
+from skhron.keyboards.callbacks import LikedPageCB, MenuCB
 from skhron.keyboards.common import back_to_menu_kb, media_kb
 from skhron.services import access
 from skhron.utils.fsm import clear_state_keep_pending
 from skhron.utils.media import media_caption, send_media
 from skhron.filters import PrivateCallback
 
-router = Router(name="favorites")
+router = Router(name="liked")
 # кнопки личных экранов, пересланные в группу, там не работают
 router.callback_query.filter(PrivateCallback())
 
-EMPTY_TEXT = "В избранном пусто. Жми ⭐️ под любым мемом!"
+EMPTY_TEXT = "Ты ещё ничего не лайкал ❤️ Лайки ставятся под мемами в группах"
 JUMP_PROMPT = "Напиши номер поста (1–{total}) — перейду к нему 🔢"
 JUMP_CANCELLED_TEXT = "Ок, не переходим 👌"
 NOT_A_NUMBER_TEXT = "Нужен просто номер, например 12"
-OUT_OF_RANGE_TEXT = "В ленте всего {total} постов, а ты просишь {num} 🙃"
+OUT_OF_RANGE_TEXT = "В списке всего {total} 🙃"
+EMPTY_LIST_TEXT = "Список пуст"
 
 
-class FavJumpStates(StatesGroup):
+class LikedJumpStates(StatesGroup):
     waiting_number = State()
 
 
@@ -67,31 +73,31 @@ async def _show_text_screen(
 
 
 def _nav_row(offset: int, total: int) -> list[InlineKeyboardButton]:
-    """[◀️] [позиция/всего] [▶️]; на краях стрелку не показываем (как в группе),
+    """[◀️] [позиция/всего] [▶️]; на краях стрелку не показываем,
     счётчик всегда есть — клик по нему открывает ввод номера (offset=-1)."""
     row: list[InlineKeyboardButton] = []
     if offset > 0:
         row.append(
             InlineKeyboardButton(
-                text="◀️", callback_data=FavPageCB(offset=offset - 1).pack()
+                text="◀️", callback_data=LikedPageCB(offset=offset - 1).pack()
             )
         )
     row.append(
         InlineKeyboardButton(
             text=f"{offset + 1}/{total}",
-            callback_data=FavPageCB(offset=-1).pack(),
+            callback_data=LikedPageCB(offset=-1).pack(),
         )
     )
     if offset + 1 < total:
         row.append(
             InlineKeyboardButton(
-                text="▶️", callback_data=FavPageCB(offset=offset + 1).pack()
+                text="▶️", callback_data=LikedPageCB(offset=offset + 1).pack()
             )
         )
     return row
 
 
-async def _send_favorite_media(
+async def _send_liked_media(
     session: AsyncSession,
     user: User,
     config: Config,
@@ -101,9 +107,9 @@ async def _send_favorite_media(
     offset: int,
     total: int,
 ) -> bool:
-    """Пост избранного уходит НОВЫМ сообщением; старые не удаляем — как в рандоме.
+    """Пост уходит НОВЫМ сообщением; старые не удаляем — как в избранном.
 
-    Возвращает False, если отправить не получилось (как в group.py).
+    Возвращает False, если отправить не получилось.
     """
     category = await repo.get_category(session, media.category_id)
     deletable = await access.can_delete_media(
@@ -126,7 +132,7 @@ async def _send_favorite_media(
     return True
 
 
-async def _show_favorite_item(
+async def _show_liked_item(
     callback: CallbackQuery,
     session: AsyncSession,
     user: User,
@@ -134,26 +140,21 @@ async def _show_favorite_item(
     bot: Bot,
     offset: int,
 ) -> None:
-    category_ids = await access.viewable_category_ids(session, user, config)
-    media, total = await repo.get_favorite_item(
-        session, user.id, category_ids, offset
-    )
+    media, total = await repo.get_liked_item(session, user.id, offset)
     if total == 0:
         await _show_text_screen(callback, bot, EMPTY_TEXT, back_to_menu_kb())
         await callback.answer()
         return
     if media is None or offset >= total:
-        # Избранное сократилось (файлы удалили) — прыгаем на последний элемент
+        # Список сократился (мемы удалили / лайки сняли) — прыгаем на последний
         offset = min(offset, total - 1)
-        media, total = await repo.get_favorite_item(
-            session, user.id, category_ids, offset
-        )
+        media, total = await repo.get_liked_item(session, user.id, offset)
         if media is None:
             await _show_text_screen(callback, bot, EMPTY_TEXT, back_to_menu_kb())
             await callback.answer()
             return
 
-    sent = await _send_favorite_media(
+    sent = await _send_liked_media(
         session, user, config, bot, _chat_id(callback), media, offset, total
     )
     if not sent:
@@ -166,27 +167,25 @@ async def _start_jump(
     callback: CallbackQuery,
     session: AsyncSession,
     user: User,
-    config: Config,
     bot: Bot,
     state: FSMContext,
 ) -> None:
     """Клик по счётчику «N/M» — включаем режим «жду номер поста»."""
-    category_ids = await access.viewable_category_ids(session, user, config)
-    _, total = await repo.get_favorite_item(session, user.id, category_ids, 0)
+    _, total = await repo.get_liked_item(session, user.id, 0)
     if total == 0:
-        await callback.answer("В избранном пусто 🕸", show_alert=True)
+        await callback.answer(EMPTY_LIST_TEXT, show_alert=True)
         return
     kb = InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
                     text="↩️ Отмена",
-                    callback_data=FavPageCB(offset=-2).pack(),
+                    callback_data=LikedPageCB(offset=-2).pack(),
                 )
             ]
         ]
     )
-    # Сначала шлём вопрос и только при успехе ставим состояние (как в group.py):
+    # Сначала шлём вопрос и только при успехе ставим состояние (как в избранном):
     # иначе после неудачной отправки юзер застрянет в режиме ввода
     # без видимого промпта и кнопки «Отмена»
     try:
@@ -196,11 +195,9 @@ async def _start_jump(
     except TelegramAPIError:
         await callback.answer("Не получилось отправить вопрос 😕", show_alert=True)
         return
-    # update_data (не set_data) — не затираем dup_candidates и данные других
-    # потоков; состояние collecting перезаписываем осознанно: юзер переключился
-    # на листание, его загрузка потом завершится как «протухшая»
-    await state.update_data(favjump_total=total)
-    await state.set_state(FavJumpStates.waiting_number)
+    # update_data (не set_data) — не затираем dup_candidates и данные других потоков
+    await state.update_data(ljump_total=total)
+    await state.set_state(LikedJumpStates.waiting_number)
     await callback.answer()
 
 
@@ -208,7 +205,7 @@ async def _cancel_jump(callback: CallbackQuery, state: FSMContext) -> None:
     """Кнопка «↩️ Отмена» (offset=-2): выходим из режима ввода номера.
     Состояние снимаем только если это действительно наш режим — протухшая
     кнопка не должна ломать чужой FSM-диалог."""
-    if await state.get_state() == FavJumpStates.waiting_number.state:
+    if await state.get_state() == LikedJumpStates.waiting_number.state:
         await clear_state_keep_pending(state)
     message = callback.message
     if isinstance(message, Message):
@@ -219,21 +216,21 @@ async def _cancel_jump(callback: CallbackQuery, state: FSMContext) -> None:
     await callback.answer()
 
 
-@router.callback_query(MenuCB.filter(F.action == "favorites"))
-async def favorites_menu(
+@router.callback_query(MenuCB.filter(F.action == "liked"))
+async def liked_menu(
     callback: CallbackQuery,
     session: AsyncSession,
     user: User,
     config: Config,
     bot: Bot,
 ) -> None:
-    await _show_favorite_item(callback, session, user, config, bot, offset=0)
+    await _show_liked_item(callback, session, user, config, bot, offset=0)
 
 
-@router.callback_query(FavPageCB.filter())
-async def favorites_page(
+@router.callback_query(LikedPageCB.filter())
+async def liked_page(
     callback: CallbackQuery,
-    callback_data: FavPageCB,
+    callback_data: LikedPageCB,
     session: AsyncSession,
     user: User,
     config: Config,
@@ -244,24 +241,24 @@ async def favorites_page(
     поста; -2 — «↩️ Отмена» под приглашением ввода номера: выйти из режима
     ввода. Остальное — обычная навигация."""
     if callback_data.offset == -1:
-        await _start_jump(callback, session, user, config, bot, state)
+        await _start_jump(callback, session, user, bot, state)
         return
     if callback_data.offset == -2:
         await _cancel_jump(callback, state)
         return
     # Обычная навигация выводит из режима ввода номера: иначе состояние
     # висело бы дальше, и следующий присланный файл ушёл бы в abort-хендлер
-    if await state.get_state() == FavJumpStates.waiting_number.state:
+    if await state.get_state() == LikedJumpStates.waiting_number.state:
         await clear_state_keep_pending(state)
-    await _show_favorite_item(
+    await _show_liked_item(
         callback, session, user, config, bot, callback_data.offset
     )
 
 
 @router.message(
-    StateFilter(FavJumpStates.waiting_number), F.chat.type == "private", F.text
+    StateFilter(LikedJumpStates.waiting_number), F.chat.type == "private", F.text
 )
-async def favorites_jump_number(
+async def liked_jump_number(
     message: Message,
     session: AsyncSession,
     user: User,
@@ -278,43 +275,38 @@ async def favorites_jump_number(
         return
     num = int(text)
 
-    # Свежий total: избранное (и доступы) могли измениться после клика
-    # по счётчику. Проверяем диапазон ДО запроса с offset=num-1 — заодно
-    # отсекаем отрицательные и гигантские числа
-    category_ids = await access.viewable_category_ids(session, user, config)
-    _, total = await repo.get_favorite_item(session, user.id, category_ids, 0)
+    # Свежий total: список мог измениться после клика по счётчику.
+    # Проверяем диапазон ДО запроса с offset=num-1 — заодно отсекаем
+    # отрицательные и гигантские числа
+    _, total = await repo.get_liked_item(session, user.id, 0)
     if total == 0:
-        # Избранное опустело (или отозвали последний доступ — get_favorite_item
-        # вернёт (None, 0)) — выходим, а не зацикливаем «всего 0 постов»
+        # Список опустел — выходим, а не зацикливаем «всего 0 постов»
         await clear_state_keep_pending(state)
-        await message.answer("В избранном пусто 🕸")
+        await message.answer(EMPTY_LIST_TEXT)
         return
     if num < 1 or num > total:
-        await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
+        await message.answer(OUT_OF_RANGE_TEXT.format(total=total))
         return
-    media, total = await repo.get_favorite_item(
-        session, user.id, category_ids, num - 1
-    )
+    media, total = await repo.get_liked_item(session, user.id, num - 1)
     if media is None:
-        # гонка: избранное сократилось между двумя запросами
-        await message.answer(OUT_OF_RANGE_TEXT.format(total=total, num=num))
+        # гонка: список сократился между двумя запросами
+        await message.answer(OUT_OF_RANGE_TEXT.format(total=total))
         return
 
     await clear_state_keep_pending(state)
-    sent = await _send_favorite_media(
+    sent = await _send_liked_media(
         session, user, config, bot, message.chat.id, media, num - 1, total
     )
     if not sent:
         await message.answer("Не получилось отправить мем 😕")
 
 
-@router.message(StateFilter(FavJumpStates.waiting_number), F.chat.type == "private")
-async def favorites_jump_media_abort(message: Message, state: FSMContext) -> None:
+@router.message(StateFilter(LikedJumpStates.waiting_number), F.chat.type == "private")
+async def liked_jump_media_abort(message: Message, state: FSMContext) -> None:
     """Не-текст в режиме ввода номера (мем, стикер, войс): выходим из режима.
     Иначе файл молча пропадёт — upload-хендлеры фильтруют по другим состояниям,
     а случайный клик по счётчику превращается в тупик."""
     await clear_state_keep_pending(state)
     await message.answer(
-        "Ок, выхожу из перехода по номеру 👌 "
-        "Пришли файл ещё раз — предложу, куда сохранить 📤"
+        "Ок, выхожу из перехода 👌 Пришли файл ещё раз — предложу, куда сохранить"
     )

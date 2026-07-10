@@ -17,8 +17,11 @@ from skhron.keyboards.callbacks import MenuCB, RandomCB
 from skhron.keyboards.common import back_to_menu_kb, categories_pick_kb, media_kb
 from skhron.services import access
 from skhron.utils.media import media_caption, send_media
+from skhron.filters import PrivateCallback
 
 router = Router(name="random_media")
+# кнопки личных экранов, пересланные в группу, там не работают
+router.callback_query.filter(PrivateCallback())
 
 PICK_TEXT = (
     "🎲 <b>Рандом из Схрона</b>\n\n"
