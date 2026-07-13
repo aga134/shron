@@ -102,6 +102,8 @@ Admins listed in `ADMIN_IDS` are permanent; additional admins can be promoted fr
 
 Add the bot to a group. It registers the chat and appears in the admin panel under Groups, where categories can be toggled per group. Group-to-supergroup migration is handled automatically, including forum topics.
 
+**`/save` requires message visibility.** With Bot API privacy mode enabled (the BotFather default), Telegram does not include `reply_to_message` for other users' messages, so the bot cannot see the meme being saved. Either promote the bot to a group administrator (takes effect immediately), or disable privacy mode via BotFather (`/setprivacy` → Disable) — in that case the bot must be removed from each existing group and re-added for the change to apply. Disabling privacy also makes bare commands (`/random` without `@botname`) reliable in groups that contain other bots. The bot registers group members in its database only when they interact with it (a command or a reply to its message), so disabled privacy does not turn every chatter into a user record.
+
 ## Project layout
 
 ```
